@@ -103,6 +103,7 @@ from vllm.sampling_params import RequestOutputKind
 
 from cosmos_curate.core.utils.misc import grouping
 from cosmos_curate.models.vllm_cosmos_reason1_vl import VllmCosmosReason1VL
+from cosmos_curate.models.vllm_gemma4 import VllmGemma4
 from cosmos_curate.models.vllm_cosmos_reason2_vl import VllmCosmosReason2VL
 from cosmos_curate.models.vllm_nemotron import VllmNemotronNano12Bv2VL
 from cosmos_curate.models.vllm_plugin import VllmPlugin
@@ -123,6 +124,7 @@ from cosmos_curate.pipelines.video.utils.data_model import (
 # Add new vLLM plugins to _VLLM_PLUGINS
 _VLLM_PLUGINS = {
     VllmCosmosReason1VL.model_variant(): VllmCosmosReason1VL,
+    VllmGemma4.model_variant(): VllmGemma4,
     VllmCosmosReason2VL.model_variant(): VllmCosmosReason2VL,
     VllmNemotronNano12Bv2VL.model_variant(): VllmNemotronNano12Bv2VL,
     VllmQwen3VL235B.model_variant(): VllmQwen3VL235B,
@@ -358,6 +360,28 @@ def make_model_inputs(  # noqa: PLR0913
     ]
 
 
+def make_multiview_model_input(
+    frames_list: list[torch.Tensor],
+    config: VllmConfig,
+    processor: AutoProcessor,
+    prompt: str,
+) -> dict[str, Any]:
+    """Make a single multi-view model input from multiple camera frame tensors.
+
+    Args:
+        frames_list: List of frame tensors, one per camera view (e.g. [left, front, right]).
+        config: The configuration for the vLLM model.
+        processor: The processor to use for the vLLM model.
+        prompt: The prompt describing all camera views.
+
+    Returns:
+        A single LLM input dict with all camera views encoded as separate videos.
+
+    """
+    vllm_plugin = _get_vllm_plugin(config.model_variant)
+    return vllm_plugin.make_multiview_llm_input(prompt, frames_list, processor)
+
+
 def vllm_generate(
     llm: LLM,
     sampling_params: SamplingParams,
@@ -455,6 +479,7 @@ def _caption_no_inflight_batching(  # noqa: PLR0913
     """
     vllm_plugin = _get_vllm_plugin(vllm_config.model_variant)
 
+    # Wrap inputs in VllmCaptionRequest objects
     requests = [
         VllmCaptionRequest(
             request_id=secrets.token_hex(8),
@@ -648,6 +673,7 @@ def vllm_caption(  # noqa: PLR0913
             model_inputs, llm, processor, sampling_params, vllm_config, max_inflight_requests, stage2_prompts
         )
 
+            #We used this one
     return _caption_no_inflight_batching(
         model_inputs,
         llm,

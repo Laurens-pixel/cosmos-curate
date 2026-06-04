@@ -15,6 +15,7 @@
 """OpenAI-compatible API captioning stage for remote VLM inference (e.g. vLLM serving)."""
 
 import base64
+import io
 from typing import TYPE_CHECKING, Any
 
 import nvtx  # type: ignore[import-untyped]
@@ -117,6 +118,31 @@ class OpenAICaptionStage(CuratorStage):
         self._client = openai.OpenAI(**client_kwargs)
         self._model_name = resolve_model_name_auto(self._client, self._model_name, endpoint_label="OpenAI caption")
 
+    @staticmethod
+    def _extract_frame_jpegs(mp4_data: bytes, num_frames: int = 8) -> list[str]:
+        """Decode mp4 bytes and return evenly-sampled frames as base64 JPEG strings."""
+        import av  # PyAV — available in unified env via core feature
+
+        container = av.open(io.BytesIO(bytes(mp4_data)))
+        raw: list[Any] = []
+        for frame in container.decode(video=0):
+            raw.append(frame.to_image())
+        container.close()
+
+        if not raw:
+            return []
+
+        count = min(num_frames, len(raw))
+        step = (len(raw) - 1) / max(count - 1, 1)
+        indices = [round(i * step) for i in range(count)]
+
+        result = []
+        for idx in indices:
+            buf = io.BytesIO()
+            raw[idx].save(buf, format="JPEG", quality=85)
+            result.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+        return result
+
     def _generate_caption(self, window: Window) -> str:
         """Generate a caption for a single window with retry logic."""
         client = self._client
@@ -129,16 +155,19 @@ class OpenAICaptionStage(CuratorStage):
             msg = "Window missing mp4 bytes; enable keep_mp4 in the prep stage."
             raise RuntimeError(msg)
 
-        video_b64 = base64.b64encode(bytes(mp4_data)).decode("utf-8")
+        frame_jpegs = self._extract_frame_jpegs(mp4_data, num_frames=8)
+        if not frame_jpegs:
+            msg = "Could not extract any frames from window mp4 bytes."
+            raise RuntimeError(msg)
+        logger.debug(f"Sending {len(frame_jpegs)} frames to OpenAI API")
+
         instruction = self._prompt.strip()
 
         content_parts: list[dict[str, Any]] = [
-            {
-                "type": "video_url",
-                "video_url": {"url": f"data:video/mp4;base64,{video_b64}"},
-            },
-            {"type": "text", "text": instruction},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{jpeg}"}}
+            for jpeg in frame_jpegs
         ]
+        content_parts.append({"type": "text", "text": instruction})
 
         request_kwargs: dict[str, Any] = {
             "model": self._model_name,
@@ -148,7 +177,7 @@ class OpenAICaptionStage(CuratorStage):
 
         @tenacity.retry(
             stop=tenacity.stop_after_attempt(self._max_caption_retries),
-            wait=tenacity.wait_fixed(self._retry_delay_seconds),
+            wait=tenacity.wait_exponential(multiplier=self._retry_delay_seconds, min=self._retry_delay_seconds, max=60),
             retry=tenacity.retry_if_not_exception_type(
                 (openai.AuthenticationError, openai.NotFoundError, openai.BadRequestError),
             ),

@@ -125,6 +125,29 @@ class VllmPlugin(ABC):
         """
 
     @staticmethod
+    def make_multiview_llm_input(
+        prompt: str,
+        frames_list: list[torch.Tensor],
+        processor: AutoProcessor,
+    ) -> dict[str, Any]:
+        """Make LLM inputs for multi-view (multi-video) captioning.
+
+        Override in plugins that support multi-video input (e.g. Qwen 2.5 VL).
+        By default raises NotImplementedError.
+
+        Args:
+            prompt: The text prompt describing all camera views.
+            frames_list: List of frame tensors, one per camera view.
+            processor: The AutoProcessor to use for the LLM.
+
+        Returns:
+            A dictionary containing the LLM inputs.
+
+        """
+        msg = f"{type.__name__} does not support multi-view captioning."
+        raise NotImplementedError(msg)
+
+    @staticmethod
     @abstractmethod
     def make_refined_llm_input(
         caption: str, prev_input: dict[str, Any], processor: AutoProcessor, refine_prompt: str | None = None

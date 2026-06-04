@@ -15,6 +15,7 @@
 """Extraction stages using TransNetV2."""
 
 import math
+import time
 import uuid
 from collections.abc import Callable, Generator
 from typing import Literal
@@ -155,7 +156,10 @@ class TransNetV2ClipExtractionStage(CuratorStage):
         for task in tasks:
             self._timer.reinit(self, task.get_major_size())
             video = task.video
+            video.stage_timestamps["TransNetV2ClipExtractionStage_start"] = time.time()
             s3_file = video.input_video
+
+            # Check if the video has the required data to process
             if not video.has_metadata():
                 logger.warning(f"Incomplete metadata for {video.input_video}. Skipping...")
                 continue
@@ -163,7 +167,8 @@ class TransNetV2ClipExtractionStage(CuratorStage):
             if not video.frame_array:
                 logger.warning(f"No frame array for {video.input_video}. Skipping...")
                 continue
-
+            
+            # Process the video data
             with self._timer.time_process():
                 frames = video.frame_array.resolve()
                 if frames is None:
@@ -204,6 +209,8 @@ class TransNetV2ClipExtractionStage(CuratorStage):
                 video.frame_array.drop()  # no longer needed
                 if not video.clips:
                     logger.warning(f"No scene cut predicted for {s3_file}.")
+
+            video.stage_timestamps["TransNetV2ClipExtractionStage_end"] = time.time()
 
             if self._log_stats:
                 stage_name, stage_perf_stats = self._timer.log_stats()
@@ -255,9 +262,9 @@ def _get_predictions(
     predictions = []
     for batch in _get_batches(frames):
         batch_gpu = torch.from_numpy(batch.copy()).cuda()
-        one_hot = model(batch_gpu.unsqueeze(0))
-        predictions.append(one_hot[0, 25:75])
-    predictions_ts = torch.concatenate(predictions, 0)[: len(frames)]
+        one_hot = model(batch_gpu.unsqueeze(0))             
+        predictions.append(one_hot[0, 25:75])                #Only the center region of sliding window is kept
+    predictions_ts = torch.concatenate(predictions, 0)[: len(frames)]    #Concatenate all the predictions
     return (predictions_ts > threshold).to(torch.uint8).cpu().numpy()
 
 

@@ -23,6 +23,7 @@ from cosmos_curate.pipelines.video.captioning.captioning_stages import (
     T5StageForSplit,
 )
 from cosmos_curate.pipelines.video.captioning.gemini_caption_stage import ApiPrepStage, GeminiCaptionStage
+from cosmos_curate.pipelines.video.captioning.gemma4_direct_stage import Gemma4DirectCaptionStage
 from cosmos_curate.pipelines.video.captioning.openai_caption_stage import OpenAICaptionStage
 from cosmos_curate.pipelines.video.captioning.vllm_caption_stage import VllmCaptionStage, VllmPrepStage
 from cosmos_curate.pipelines.video.preview.preview_stages import PreviewStage
@@ -91,8 +92,11 @@ class CaptioningConfig:
     preview_target_height: int = 240
     inflight_batching: bool = True
     enhance_config: EnhanceCaptionConfig | None = None
+    multi_view: bool = False
     verbose: bool = False
     perf_profile: bool = False
+    gt_window_source: str | None = None
+    gt_task_info_dir: str | None = None
 
 
 @attrs.define(frozen=True)
@@ -163,8 +167,11 @@ class CaptioningPhase(CurationPhase):
             vllm_config=vllm_cfg_prepare,
             window_config=cfg.window_config,
             keep_mp4=cfg.keep_mp4,
+            multi_view=cfg.multi_view,
             verbose=cfg.verbose,
             log_stats=cfg.perf_profile,
+            gt_window_source=cfg.gt_window_source,
+            gt_task_info_dir=cfg.gt_task_info_dir,
         )
 
     def _build_caption_stage(self) -> CuratorStage | CuratorStageSpec:
@@ -228,6 +235,35 @@ class CaptioningPhase(CurationPhase):
     def build_stages(self) -> list[CuratorStage | CuratorStageSpec]:
         """Construct and return the prep, optional preview, caption, and enhance stages."""
         cfg = self._cfg
+
+
+        # Gemma4 uses a single combined stage (no vLLM)
+        if cfg.caption_algo.lower() == "gemma4":
+            stages: list[CuratorStage | CuratorStageSpec] = [
+                Gemma4DirectCaptionStage(
+                    window_config=cfg.window_config,
+                    prompt_variant=cfg.vllm_config.prompt_variant if cfg.vllm_config else "default",
+                    verbose=cfg.verbose,
+                    log_stats=cfg.perf_profile,
+                )
+            ]
+            if cfg.enhance_config is not None:
+                ecfg = cfg.enhance_config
+                stages.append(
+                    EnhanceCaptionStage(
+                        model_variant=ecfg.model_variant,
+                        batch_size=ecfg.batch_size,
+                        openai_model=ecfg.openai_model,
+                        fp8_enable=ecfg.fp8_enable,
+                        max_output_tokens=ecfg.max_output_tokens,
+                        prompt_variant=ecfg.prompt_variant,
+                        prompt_text=ecfg.prompt_text,
+                        verbose=ecfg.verbose,
+                        log_stats=ecfg.perf_profile,
+                    )
+                )
+            return stages
+
         stages: list[CuratorStage | CuratorStageSpec] = [self._build_prep_stage()]
 
         if cfg.generate_previews:

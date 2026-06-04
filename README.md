@@ -6,6 +6,26 @@
 
 # Cosmos-Curate
 
+---
+
+## HPC Fork — What's new
+
+This fork extends upstream cosmos-curate with four features and a full **Apptainer deployment guide** for Slurm HPC clusters.
+
+| Feature | CLI flag | Doc |
+|---|---|---|
+| C-RADIOv4-H embeddings (ViT-H, 2560-d, ~2 GB VRAM) | `--embedding-algorithm cradio` | [docs/new-features.md](docs/new-features.md#1-cradiovh-embeddings) |
+| Gemma4 / OpenAI GPT-4o / Gemini 2.5 Flash captioning | `--captioning-algorithm gemma4\|openai\|gemini` | [docs/new-features.md](docs/new-features.md#2-gemma4-direct-captioning) |
+| In-pipeline VLM caption judge (pluggable, 5 variants) | `--evaluate --judge-model vci_7b` | [docs/judge-system.md](docs/judge-system.md) |
+| GT-window captioning (bypass TransNetV2) | `--gt-windows-source agibot` | [docs/new-features.md](docs/new-features.md#4-gt-window-captioning) |
+
+**Running on a Slurm cluster with Apptainer?** Start here: [docs/hpc-apptainer.md](docs/hpc-apptainer.md)
+
+**Setting up Gemma4?** The container needs a `pip_overrides` directory: [docs/gemma4-setup.md](docs/gemma4-setup.md)
+
+---
+
+
 A powerful video curation system that processes, analyzes, and organizes video content using advanced AI models and distributed computing.
 
 ## Important

@@ -18,6 +18,7 @@ import json
 import pathlib
 import pickle
 import subprocess
+import time
 
 import numpy as np
 import nvtx  # type: ignore[import-untyped]
@@ -192,35 +193,36 @@ class VideoDownloader(CuratorStage):
         """Read video(s) specified in URI to task buffer."""
         for task in tasks:
             self._timer.reinit(self, task.get_major_size())
-            for video in task.videos:
-                with self._timer.time_process():
-                    # Download video bytes
-                    if not self._download_video_bytes(video):
-                        continue
+            video = task.video
+            video.pipeline_start_ts = time.time()
+            video.stage_timestamps["VideoDownloader_start"] = video.pipeline_start_ts
 
-                    # Extract and validate metadata
-                    if not self._extract_and_validate_metadata(video):
-                        continue
+            with self._timer.time_process():
+                # Download video bytes
+                if not self._download_video_bytes(video):
+                    continue
 
-                    try:
-                        video.was_remuxed = remux_if_needed(video, threads=1)
-                    except Exception as e:  # noqa: BLE001
-                        video.errors["remux"] = str(e)
-                        logger.exception(f"Failed to remux video {video.input_video}")
-                        continue
+                # Extract and validate metadata
+                if not self._extract_and_validate_metadata(video):
+                    continue
 
-                    # TODO(LazyData): re-enable when batch-mode ObjectRef ownership is
-                    # resolved.  In batch mode, pool.stop() kills actor -> OwnerDiedError.
-                    # video.encoded_data.store()  # noqa: ERA001
+                try:
+                    video.was_remuxed = remux_if_needed(video, threads=1)
+                except Exception as e:  # noqa: BLE001
+                    video.errors["remux"] = str(e)
+                    logger.exception(f"Failed to remux video {video.input_video}")
+                    continue
 
-                    try:
-                        video.populate_timestamps()
-                    except Exception as e:  # noqa: BLE001
-                        video.errors["timestamps"] = str(e)  # authoritative setter; intentional overwrite on retry
-                        logger.exception(f"Failed to populate timestamps for {video.input_video}")
+                try:
+                    video.populate_timestamps()
+                except Exception as e:  # noqa: BLE001
+                    video.errors["timestamps"] = str(e)
+                    logger.exception(f"Failed to populate timestamps for {video.input_video}")
 
-                    # Log video information
-                    self._log_video_info(video)
+                # Log video information
+                self._log_video_info(video)
+
+            video.stage_timestamps["VideoDownloader_end"] = time.time()
 
             if self._log_stats:
                 stage_name, stage_perf_stats = self._timer.log_stats()

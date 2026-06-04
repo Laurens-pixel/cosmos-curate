@@ -15,6 +15,7 @@
 """Remuxing stages for video pipelines."""
 
 import subprocess
+import time
 import tempfile
 from math import ceil
 from pathlib import Path
@@ -193,6 +194,7 @@ class RemuxStage(CuratorStage):
             self._deprecation_warned = True
         for task in tasks:
             self._timer.reinit(self, task.get_major_size())
+            task.video.stage_timestamps["RemuxStage_start"] = time.time()
 
             with self._timer.time_process():
                 for video in task.videos:
@@ -201,6 +203,8 @@ class RemuxStage(CuratorStage):
                     except Exception as e:  # noqa: BLE001
                         video.errors["remux"] = str(e)
                         logger.exception(f"Failed to remux video {video.input_video}")
+
+            task.video.stage_timestamps["RemuxStage_end"] = time.time()
 
             if self._log_stats:
                 stage_name, stage_perf_stats = self._timer.log_stats()

@@ -102,6 +102,7 @@ def split_video_into_windows(  # noqa: PLR0913
     target_bit_rate: str = f"{DEFAULT_TRANSCODE_BITRATE_M}M",
     return_video_frames: bool = True,
     num_threads: int = 1,
+    custom_windows: list[WindowFrameInfo] | None = None,
 ) -> tuple[list[bytes | None], list[torch.Tensor | None], list[WindowFrameInfo]]:
     """Calculate windows and return video inputs for the Qwen language model from input clips.
 
@@ -138,7 +139,7 @@ def split_video_into_windows(  # noqa: PLR0913
         with input_file.open("wb") as f:
             f.write(mp4_bytes)
         total_frames = get_frame_count(mp4_bytes)
-        windows = compute_windows(total_frames, window_size, remainder_threshold)
+        windows = custom_windows if custom_windows is not None else compute_windows(total_frames, window_size, remainder_threshold)
         video_frames: list[torch.Tensor | None] = []
         mp4_bytes_list: list[bytes | None] = []
 
@@ -206,6 +207,7 @@ def _make_windows_for_clip(  # noqa: PLR0913
     *,
     keep_mp4: bool = False,
     return_frames: bool = True,
+    custom_windows: list[WindowFrameInfo] | None = None,
 ) -> tuple[list[Window], list[torch.Tensor]]:
     """Make windows for a clip.
 
@@ -241,6 +243,7 @@ def _make_windows_for_clip(  # noqa: PLR0913
         target_bit_rate=target_bit_rate,
         return_video_frames=return_frames,
         num_threads=num_decode_threads,
+        custom_windows=custom_windows,
     )
 
     for window_bytes, window_frames_tensor, window_frame_info in zip(
@@ -273,6 +276,7 @@ def make_windows_for_video(
     *,
     keep_mp4: bool = False,
     return_frames: bool = True,
+    custom_windows: list[WindowFrameInfo] | None = None,
 ) -> tuple[list[Window], list[torch.Tensor]]:
     """Add windows to each clip in a video.
 
@@ -307,6 +311,7 @@ def make_windows_for_video(
             num_decode_threads,
             keep_mp4=keep_mp4,
             return_frames=return_frames,
+            custom_windows=custom_windows,
         )
 
         windows.extend(_windows)

@@ -233,6 +233,11 @@ def _write_split_result_summary(  # noqa: PLR0913
             client_output=client_output,
             all_video_data=all_video_data,
         )
+        _write_all_window_judgments(
+            output_path=output_path,
+            client_output=client_output,
+            all_video_data=all_video_data,
+        )
 
 
 def write_split_summary(  # noqa: PLR0913
@@ -439,5 +444,78 @@ def _write_all_window_captions(  # noqa: PLR0913
             backup_and_overwrite=True,
         )
         logger.info(f"Wrote all window captions to {dest}")
+
+    do_with_retries(_write)
+
+
+def _write_all_window_judgments(
+    *,
+    output_path: str,
+    client_output: storage_client.StorageClient | None,
+    all_video_data: dict[str, ProcessedVideoMetadata] | None = None,
+    output_s3_profile_name: str | None = None,
+    input_videos_relative: list[str] | None = None,
+    limit: int | None = None,
+) -> None:
+    """Gather all window judge results across videos and write them to a JSON file.
+
+    Output schema mirrors ``all_window_captions.json``::
+
+        {
+          "<video>": {
+            "<clip_uuid>": {
+              "<start_end>": { "<judge_variant>": { verdict, score, ... } }
+            }
+          }
+        }
+
+    A separate file is written only when at least one window has a judgment, so
+    pipelines that skip ``--evaluate`` don't litter the output dir.
+    """
+    if all_video_data is None:
+        # Hacky managed-service zip upload/download path; mirrors _write_all_window_captions.
+        assert input_videos_relative is not None
+        assert limit is not None
+        all_video_data = _read_all_video_metadata_parallel(
+            output_path,
+            output_s3_profile_name,
+            input_videos_relative,
+            limit,
+        )
+
+    all_judgments_data: dict[str, Any] = {}
+    has_any = False
+    for input_video, data in all_video_data.items():
+        if data.video_metadata is None:
+            continue
+        all_judgments_data[input_video] = {}
+        for clip_chunk in data.clip_chunks:
+            for clip_id, clip_data in clip_chunk.get("all_windows_judge", {}).items():
+                if not clip_data:
+                    continue
+                if clip_id not in all_judgments_data[input_video]:
+                    all_judgments_data[input_video][clip_id] = {}
+                all_judgments_data[input_video][clip_id].update(clip_data)
+                has_any = True
+        # Drop empty per-video entries so the file isn't full of {} when nothing was judged.
+        if not all_judgments_data[input_video]:
+            del all_judgments_data[input_video]
+
+    if not has_any:
+        # No judgments produced this run — skip writing the file entirely.
+        return
+
+    def _write() -> None:
+        dest = get_full_path(output_path, "v0", "all_window_judgments.json")
+        write_json(
+            all_judgments_data,
+            dest,
+            "all window judgments",
+            "all videos",
+            verbose=True,
+            client=client_output,
+            backup_and_overwrite=True,
+        )
+        logger.info(f"Wrote all window judgments to {dest}")
 
     do_with_retries(_write)

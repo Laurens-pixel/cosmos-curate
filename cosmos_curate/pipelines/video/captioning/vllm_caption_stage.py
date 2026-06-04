@@ -28,6 +28,9 @@ the tasks must have these attributes/methods:
 """
 
 import logging
+import re
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import nvtx  # type: ignore[import-untyped]
@@ -45,6 +48,7 @@ from cosmos_curate.core.utils.model import conda_utils, model_utils
 from cosmos_curate.models.all_models import get_all_models_by_id
 from cosmos_curate.models.prompts import get_prompt, get_stage2_prompt
 from cosmos_curate.models.vllm_model_ids import get_vllm_model_id
+from cosmos_curate.pipelines.video.captioning.gt_window_provider import GTWindowProvider, make_gt_window_provider
 from cosmos_curate.pipelines.video.utils import windowing_utils
 from cosmos_curate.pipelines.video.utils.data_model import (
     Video,
@@ -63,6 +67,7 @@ if conda_utils.is_running_in_env("unified"):
         auto_processor,
         make_metadata,
         make_model_inputs,
+        make_multiview_model_input,
         sampling_params,
         vllm_caption,
         vllm_model,
@@ -133,7 +138,7 @@ def _scatter_captions(
 
     """
     for window, caption, clip_uuid in zip(windows, captions, clip_uuids, strict=True):
-        window.caption[model_variant] = caption
+        window.caption[model_variant] = caption                 #Sets the caption for the window
         if verbose:
             logger.info(f"Caption for clip {clip_uuid}: {caption}")
 
@@ -190,6 +195,11 @@ class VllmModelInterface(ModelInterface):
 class VllmPrepStage(CuratorStage):
     """Stage that prepares cosmos-curate video data for vLLM multimodal model processing."""
 
+    # Camera names expected in multi-view mode, in input order (left, front, right).
+    _MULTIVIEW_CAMERAS = ["CAM_FRONT_LEFT", "CAM_FRONT", "CAM_FRONT_RIGHT"]
+    # Regex to parse nuScenes-style filenames: scene-XXXX_CAM_FRONT.mp4
+    _SCENE_CAMERA_RE = re.compile(r"^(.+?)_(CAM_[A-Z_]+)\.mp4$", re.IGNORECASE)
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -198,6 +208,9 @@ class VllmPrepStage(CuratorStage):
         keep_mp4: bool = False,
         verbose: bool = False,
         log_stats: bool = False,
+        multi_view: bool = False,
+        gt_window_source: str | None = None,
+        gt_task_info_dir: str | None = None,
     ) -> None:
         """Initialize the vLLM Preparation Stage.
 
@@ -207,6 +220,11 @@ class VllmPrepStage(CuratorStage):
             keep_mp4: Keep mp4 bytes for the clips in memory.
             verbose: Whether to print verbose logs.
             log_stats: Whether to log performance statistics.
+            multi_view: If True, group camera triplets per scene and produce one
+                combined multi-view caption per scene (stored on CAM_FRONT clip only).
+            gt_window_source: GT window provider name (e.g. ``"agibot"``).  When set,
+                ``compute_windows`` is bypassed and GT action frame ranges are used instead.
+            gt_task_info_dir: Path to task info directory passed to the provider constructor.
 
         """
         super().__init__()
@@ -219,6 +237,13 @@ class VllmPrepStage(CuratorStage):
         self._processor: AutoProcessor | None = None
         self._keep_mp4 = keep_mp4
         self._model = VllmModelInterface(self._vllm_config)
+        self._multi_view = multi_view
+        self._gt_window_source = gt_window_source
+        self._gt_task_info_dir = gt_task_info_dir
+        self._gt_provider: GTWindowProvider | None = None
+        # Buffer: scene_id -> {camera_name -> (Video, task)}. Used only when multi_view=True.
+        # Tasks are stored here so they can be retrieved across batches when a triplet completes.
+        self._scene_buffer: dict[str, dict[str, tuple[Video, Any]]] = {}
 
     def secondary_name(self) -> str:
         """Get the secondary name of the stage.
@@ -239,6 +264,21 @@ class VllmPrepStage(CuratorStage):
             The resource requirements for this stage.
 
         """
+        if self._multi_view:
+            # Force exactly 1 worker by requesting >half of the schedulable CPUs.
+            # cosmos_xenna allocates cpu_allocation_percentage=0.95 of total CPUs.
+            # Requesting schedulable//2 + 1 guarantees floor(schedulable / request) == 1
+            # while staying within the schedulable budget (avoids the allocation panic).
+            try:
+                import ray as _ray  # noqa: PLC0415
+                total_ray_cpus = int(_ray.cluster_resources().get("CPU", 72)) if _ray.is_initialized() else 72
+            except Exception:  # noqa: BLE001
+                total_ray_cpus = 72
+            schedulable = int(total_ray_cpus * 0.95)
+            cpus = max(schedulable // 2 + 1, 1)
+            return CuratorStageResource(cpus=cpus)
+
+        #Default number of CPUs for the vLLM model: 2.0
         return CuratorStageResource(cpus=self._vllm_config.num_cpus_for_prepare)
 
     @property
@@ -254,6 +294,93 @@ class VllmPrepStage(CuratorStage):
     def stage_setup(self) -> None:
         """Set up the model for processing."""
         self._processor = auto_processor(self._vllm_config)
+        if self._gt_window_source is not None and self._gt_task_info_dir is not None:
+            self._gt_provider = make_gt_window_provider(
+                self._gt_window_source, task_info_dir=self._gt_task_info_dir
+            )
+
+    def _parse_scene_camera(self, video: Video) -> tuple[str, str]:
+        """Parse the source video filename into (scene_id, camera_name).
+
+        Expects filenames like ``scene-0061_CAM_FRONT.mp4``.
+
+        Args:
+            video: The video whose source path to parse.
+
+        Returns:
+            A tuple of (scene_id, camera_name). If the filename does not match
+            the expected pattern, returns (stem, "unknown") and logs a warning.
+
+        """
+        filename = Path(video.input_path).name
+        match = self._SCENE_CAMERA_RE.match(filename)
+        if match:
+            return match.group(1), match.group(2).upper()
+        logger.warning(
+            f"Multi-view: could not parse scene/camera from '{filename}'. "
+            "Expected pattern '<scene_id>_CAM_<NAME>.mp4'. Treating as standalone."
+        )
+        return Path(filename).stem, "unknown"
+
+    def _prep_multiview_windows(self, group: dict[str, tuple[Video, Any]], prompt: str) -> None:
+        """Prepare multi-view windows for a complete camera triplet.
+
+        Extracts frames from CAM_FRONT_LEFT, CAM_FRONT, and CAM_FRONT_RIGHT,
+        then creates a single combined LLM input (stored on the CAM_FRONT clip
+        windows only). Left and right clips have their windows created but receive
+        no model_input, so VllmCaptionStage will skip them.
+
+        Args:
+            group: Mapping of camera_name -> (Video, task) for one scene (must contain
+                   all three cameras in _MULTIVIEW_CAMERAS).
+            prompt: The captioning prompt to use.
+
+        """
+        if self._processor is None:
+            msg = "self._processor not initialized, call stage_setup() first"
+            raise RuntimeError(msg)
+
+        num_decode_threads = max(1, int(self.resources.cpus) + 1)
+
+        # When combining 3 camera videos in one vLLM request, the total visual
+        # token count is 3× the single-view count and can exceed max_model_len.
+        # Halving the sampling_fps reduces frames/video from ~40 to ~20, keeping
+        # 3 × ~20 × ~343 tokens/frame ≈ 20 580 well within max_model_len=32768.
+        import attrs as _attrs  # noqa: PLC0415
+
+        _mv_config = _attrs.evolve(self._window_config, sampling_fps=self._window_config.sampling_fps / 2.0)
+
+        # Extract frames for every camera; make_windows_for_video attaches
+        # Window objects to each clip in-place.
+        per_camera_frames: list[list] = []
+        for cam in self._MULTIVIEW_CAMERAS:
+            video, _task = group[cam]
+            _windows, frames = windowing_utils.make_windows_for_video(
+                video,
+                _mv_config,
+                num_decode_threads,
+                keep_mp4=self._keep_mp4,
+            )
+            per_camera_frames.append(frames)  # list of tensors, one per window
+
+        # Build one multi-view model_input per window index on the FRONT clip.
+        front_video, _front_task = group["CAM_FRONT"]
+        num_windows = len(per_camera_frames[1])  # number of windows in FRONT video
+
+        front_windows: list[Window] = []
+        for clip in front_video.clips:
+            front_windows.extend(clip.windows)
+
+        for win_idx in range(num_windows):
+            frames_list = [per_camera_frames[cam_idx][win_idx] for cam_idx in range(len(self._MULTIVIEW_CAMERAS))]
+            llm_input = make_multiview_model_input(
+                frames_list,
+                self._vllm_config,
+                self._processor,
+                prompt,
+            )
+            if win_idx < len(front_windows):
+                front_windows[win_idx].model_input[self._vllm_config.model_variant] = llm_input
 
     def _prep_windows(self, video: Video, prompt: str) -> None:
         """Prep the windows for the vLLM model.
@@ -274,16 +401,19 @@ class VllmPrepStage(CuratorStage):
 
         num_video_decode_threads = max(1, int(self.resources.cpus) + 1)
 
+        custom_windows = self._gt_provider.get_windows(video.input_path) if self._gt_provider else None
+
         windows, frames = windowing_utils.make_windows_for_video(
             video,
             self._window_config,
             num_video_decode_threads,
             keep_mp4=self._keep_mp4,
+            custom_windows=custom_windows,
         )
 
         metadata = make_metadata(frames, self._window_config)
 
-        # Create debug identifiers for frame organization
+        # (Optional)Create debug identifiers for frame organization
         debug_window_ids = None
         if self._vllm_config.debug_save_frames:
             debug_window_ids = []
@@ -295,8 +425,9 @@ class VllmPrepStage(CuratorStage):
                         clip_uuid = str(clip.uuid)
                         break
                 debug_window_ids.append(clip_uuid)
-
-        llm_inputs = make_model_inputs(
+        
+        #create the model inputs for the vLLM model
+        llm_inputs = make_model_inputs(  
             frames,
             metadata,
             self._vllm_config,
@@ -304,7 +435,8 @@ class VllmPrepStage(CuratorStage):
             prompt,
             debug_window_ids=debug_window_ids,
         )
-
+        
+        #stores the llm inputs 
         for window, llm_input in zip(windows, llm_inputs, strict=True):
             window.model_input[self._vllm_config.model_variant] = llm_input
 
@@ -316,7 +448,9 @@ class VllmPrepStage(CuratorStage):
             tasks: The tasks to process.
 
         Returns:
-            The processed tasks.
+            The processed tasks. In multi-view mode, tasks are held in an internal
+            buffer until a complete camera triplet is available; only complete
+            triplets are returned. Incomplete groups are logged as warnings.
 
         """
         if self._processor is None:
@@ -329,21 +463,60 @@ class VllmPrepStage(CuratorStage):
             verbose=self._verbose,
         )
 
-        for task in tasks:
-            major_size = task.get_major_size()
-            self._timer.reinit(self, major_size)
+        if not self._multi_view:
+            # --- Single-view path (unchanged behaviour) ---
+            for task in tasks:
+                major_size = task.get_major_size()
+                self._timer.reinit(self, major_size)
 
+                video = get_video_from_task(task)
+                video.stage_timestamps["VllmPrepStage_start"] = time.time()
+
+                with self._timer.time_process():
+                    self._prep_windows(video, prompt)           #prepares the windows for the vLLM model, splits each clip into 256-frame windows
+
+                video.stage_timestamps["VllmPrepStage_end"] = time.time()
+
+                stage_perf = getattr(task, "stage_perf", None)
+                if self._log_stats and stage_perf is not None:
+                    stage_name, stage_perf_stats = self._timer.log_stats()
+                    stage_perf[stage_name] = stage_perf_stats
+
+            return tasks
+
+        # --- Multi-view path ---
+        # Store (Video, task) in the buffer keyed by scene_id and camera name.
+        # Tasks must be stored here (not in a local dict) so they survive across
+        # multiple process_data() calls when triplet partners arrive in later batches.
+        for task in tasks:
             video = get_video_from_task(task)
+            scene_id, camera = self._parse_scene_camera(video)
+            self._scene_buffer.setdefault(scene_id, {})[camera] = (video, task)
+
+        required_cameras = set(self._MULTIVIEW_CAMERAS)
+        completed_tasks: list[T] = []
+
+        for scene_id in list(self._scene_buffer.keys()):
+            group = self._scene_buffer[scene_id]
+            if not required_cameras.issubset(group.keys()):
+                continue  # Wait for the remaining cameras to arrive in a future batch
 
             with self._timer.time_process():
-                self._prep_windows(video, prompt)
+                self._prep_multiview_windows(group, prompt)
 
-            stage_perf = getattr(task, "stage_perf", None)
-            if self._log_stats and stage_perf is not None:
-                stage_name, stage_perf_stats = self._timer.log_stats()
-                stage_perf[stage_name] = stage_perf_stats
+            # Retrieve the stored tasks for all three cameras and return them.
+            for cam in self._MULTIVIEW_CAMERAS:
+                _video, stored_task = group[cam]
+                completed_tasks.append(cast("T", stored_task))
 
-        return tasks
+            del self._scene_buffer[scene_id]
+
+        # Incomplete groups remain in the buffer for future batches.
+        if self._scene_buffer:
+            waiting = {sid: list(cams.keys()) for sid, cams in self._scene_buffer.items()}
+            logger.debug(f"Multi-view: waiting for partner cameras: {waiting}")
+
+        return completed_tasks
 
 
 class VllmCaptionStage(CuratorStage):
@@ -439,9 +612,9 @@ class VllmCaptionStage(CuratorStage):
 
     def _reset(self) -> None:
         """Reset the vLLM model."""
-        del self._llm
-        del self._sampling_params
-        del self._processor
+        self._llm = None  # set to None (not del) so stage_setup can check `is None`
+        self._sampling_params = None
+        self._processor = None
         self.destroy()
         self.stage_setup()
 
@@ -487,7 +660,7 @@ class VllmCaptionStage(CuratorStage):
         return self._model
 
     @nvtx.annotate("VllmCaptionStage")  # type: ignore[untyped-decorator]
-    def process_data(self, tasks: list[T]) -> list[T]:  # noqa: C901
+    def process_data(self, tasks: list[T]) -> list[T]:  # noqa: C901           
         """Process the data for the vLLM caption stage.
 
         Args:
@@ -544,25 +717,40 @@ class VllmCaptionStage(CuratorStage):
 
                 return captions
 
-        with self._timer.time_process():
+        _caption_stage_start = time.time()
+        with self._timer.time_process():            
             # Gather model inputs and clip uuids
-            windows, clip_uuids = _get_windows_from_tasks(tasks)
-            model_inputs = [window.model_input[self._vllm_config.model_variant] for window in windows]
+            windows, clip_uuids = _get_windows_from_tasks(tasks)     
+
+            # Filter to only windows that have model_input for this variant.
+            # In multi-view mode, only FRONT clip windows have model_input populated;
+            # FRONT_LEFT and FRONT_RIGHT windows pass through without captioning.
+            variant = self._vllm_config.model_variant
+            active_pairs = [(w, u) for w, u in zip(windows, clip_uuids) if variant in w.model_input]
+            active_windows = [p[0] for p in active_pairs]
+            active_clip_uuids = [p[1] for p in active_pairs]
+            model_inputs = [w.model_input[variant] for w in active_windows]
 
             # Set up stage 2 prompts if enabled
-            stage2_prompts = _get_stage2_prompts(self._vllm_config, len(windows))
+            stage2_prompts = _get_stage2_prompts(self._vllm_config, len(active_windows))
 
             # Generate captions
             try:
-                captions = _vllm_caption(model_inputs, stage2_prompts)
+                captions = _vllm_caption(model_inputs, stage2_prompts) if active_windows else [] #start here
             except Exception:  # noqa: BLE001
                 logger.error(f"All {self._vllm_config.max_retries} retry attempts exhausted, returning empty captions")
                 captions = [""] * len(model_inputs)
 
             # Scatter captions back to windows
-            _scatter_captions(windows, captions, clip_uuids, self._vllm_config.model_variant, verbose=self._verbose)
+            _scatter_captions(active_windows, captions, active_clip_uuids, variant, verbose=self._verbose)
 
             logger.info(f"Generated {len(captions)} captions for {len(tasks)} tasks")
+
+        _caption_stage_end = time.time()
+        for task in tasks:
+            _v = get_video_from_task(task)
+            _v.stage_timestamps["VllmCaptionStage_start"] = _caption_stage_start
+            _v.stage_timestamps["VllmCaptionStage_end"] = _caption_stage_end
 
         if self._log_stats:
             # Because there's a single call to caption all tasks, just log the first task's stage_perf.

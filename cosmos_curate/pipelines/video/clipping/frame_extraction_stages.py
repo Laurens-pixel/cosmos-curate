@@ -15,6 +15,7 @@
 """Ray stage for loading resized frames from videos as 4-D numpy array."""
 
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -140,6 +141,7 @@ class VideoFrameExtractionStage(CuratorStage):
         height, width = self.output_hw
         for task in tasks:
             video = task.video
+            video.stage_timestamps["VideoFrameExtractionStage_start"] = time.time()
             data = video.encoded_data.resolve()
             if data is None:
                 error_msg = "Please load video bytes!"
@@ -185,6 +187,7 @@ class VideoFrameExtractionStage(CuratorStage):
 
                 if self._verbose and video.frame_array.value is not None:
                     logger.info(f"Loaded video as numpy uint8 array with shape {video.frame_array.value.shape}")
+                video.stage_timestamps["VideoFrameExtractionStage_end"] = time.time()
 
         if self._log_stats:
             stage_name, stage_perf_stats = self._timer.log_stats()

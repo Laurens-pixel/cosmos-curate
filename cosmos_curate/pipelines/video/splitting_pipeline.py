@@ -73,6 +73,7 @@ from cosmos_curate.pipelines.video.clipping.phases import (
     TransNetV2SplitPhase,
 )
 from cosmos_curate.pipelines.video.embedding.phases import EmbeddingConfig, EmbeddingPhase, OpenAIEmbeddingConfig
+from cosmos_curate.pipelines.video.evaluation.phases import JudgePhase, JudgePhaseConfig
 from cosmos_curate.pipelines.video.filtering.aesthetics.phases import (
     AestheticFilterConfig,
     AestheticFilterPhase,
@@ -99,7 +100,7 @@ from cosmos_curate.pipelines.video.utils.video_pipe_input import (
 QWEN2_CAPTION_ALGOS = {"qwen"}
 QWEN3_CAPTION_ALGOS = {"qwen3_vl_30b", "qwen3_vl_30b_fp8", "qwen3_vl_235b", "qwen3_vl_235b_fp8"}
 COSMOS_REASON_ALGOS = {"cosmos_r1", "cosmos_r2"}
-ALL_CAPTION_ALGOS = VLLM_CAPTION_ALGOS | {"gemini", "openai"}
+ALL_CAPTION_ALGOS = VLLM_CAPTION_ALGOS | {"gemini", "openai", "gemma4"}
 MULTICAM_VIDEO_EXTENSIONS: set[str] = {".mp4"}
 QWEN3_VL_235B_HIGH_MEMORY_GPU_THRESHOLD_MB = 128_000
 
@@ -151,6 +152,15 @@ def build_input_data(
     if args.multi_cam and args.splitting_algorithm != "fixed-stride":
         error_msg = "Multi-cam only supports fixed-stride splitting; set --splitting-algorithm fixed-stride"
         raise ValueError(error_msg)
+
+    if args.gt_windows_source is not None:
+        if not args.gt_windows_task_info_dir:
+            msg = "--gt-windows-task-info-dir is required when --gt-windows-source is set."
+            raise ValueError(msg)
+        # GT frame ranges are video-absolute; the whole video must be one clip so frame
+        # numbers align. Force fixed-stride with a 1-hour duration to achieve this.
+        args.splitting_algorithm = "fixed-stride"
+        args.fixed_stride_split_duration = 3600
 
     # extract input data
     if args.multi_cam:
@@ -490,10 +500,32 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
 
     # --- Captioning (optional) ---
     caption_algo = args.captioning_algorithm.lower()
+
+    # Keep mp4 bytes in memory after captioning if any downstream consumer needs them.
+    # VLM judges (e.g. vci_3b / vci_7b) declare evidence_kind="mp4_bytes"; check that
+    # here so the captioning stage doesn't drop bytes before JudgeStage can use them.
+    def _judge_needs_mp4(variant: str) -> bool:
+        try:
+            from cosmos_curate.models.judge_interface import get_judge_plugin_class
+
+            return get_judge_plugin_class(variant)().evidence_kind == "mp4_bytes"
+        except Exception:  # noqa: BLE001
+            return False
+
+    _active_judge_variants: list[str] = []
+    if args.evaluate:
+        if args.dual_judge:
+            _active_judge_variants = ["gemma4_e4b", "vci_7b"]
+        elif args.judge_models:
+            _active_judge_variants = [v.strip() for v in args.judge_models.split(",") if v.strip()]
+        else:
+            _active_judge_variants = [args.judge_model]
+
     keep_mp4 = (
         args.generate_previews
         or (args.generate_cosmos_predict_dataset != "disable")
         or caption_algo in {"gemini", "openai"}
+        or any(_judge_needs_mp4(v) for v in _active_judge_variants)
     )
 
     if args.generate_captions:
@@ -644,11 +676,61 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                     preview_target_height=args.preview_target_height,
                     inflight_batching=args.vllm_use_inflight_batching,
                     enhance_config=enhance_config,
+                    multi_view=args.multi_view,
                     verbose=args.verbose,
                     perf_profile=args.perf_profile,
+                    gt_window_source=args.gt_windows_source,
+                    gt_task_info_dir=args.gt_windows_task_info_dir,
                 )
             )
         )
+
+    # --- Evaluation / judging (optional) ---
+    if args.evaluate:
+        gt_source_kwargs: dict[str, object] = {}
+        if args.judge_gt_source == "agibot":
+            if not args.judge_gt_task_info_dir:
+                msg = "--judge-gt-task-info-dir is required when --judge-gt-source=agibot."
+                raise ValueError(msg)
+            gt_source_kwargs["task_info_dir"] = args.judge_gt_task_info_dir
+        elif args.judge_gt_source == "manual":
+            if not args.judge_gt_annotation_path:
+                msg = "--judge-gt-annotation-path is required when --judge-gt-source=manual."
+                raise ValueError(msg)
+            gt_source_kwargs["annotation_path"] = args.judge_gt_annotation_path
+        elif args.judge_gt_source == "youcook2":
+            if not args.judge_gt_captions_path:
+                msg = "--judge-gt-captions-path is required when --judge-gt-source=youcook2."
+                raise ValueError(msg)
+            gt_source_kwargs["gt_captions_path"] = args.judge_gt_captions_path
+        elif args.judge_gt_source == "nuscenes":
+            if not args.judge_gt_scene_json_path:
+                msg = "--judge-gt-scene-json-path is required when --judge-gt-source=nuscenes."
+                raise ValueError(msg)
+            gt_source_kwargs["scene_json_path"] = args.judge_gt_scene_json_path
+        elif args.judge_gt_source == "inhard_online":
+            if not args.judge_gt_labels_dir:
+                msg = "--judge-gt-labels-dir is required when --judge-gt-source=inhard_online."
+                raise ValueError(msg)
+            gt_source_kwargs["labels_dir"] = args.judge_gt_labels_dir
+
+        for _variant in _active_judge_variants:
+            builder.add_phase(
+                JudgePhase(
+                    JudgePhaseConfig(
+                        judge_variant=_variant,
+                        caption_source=args.judge_caption_source or args.captioning_algorithm,
+                        gt_source=args.judge_gt_source,
+                        gt_source_kwargs=gt_source_kwargs,
+                        prompt_variant=args.judge_prompt_variant,
+                        prompt_text=args.judge_prompt_text,
+                        batch_size=args.judge_batch_size,
+                        max_new_tokens=args.judge_max_new_tokens,
+                        verbose=args.verbose,
+                        perf_profile=args.perf_profile,
+                    )
+                )
+            )
 
     # --- T5 encoding (optional) ---
     if args.generate_cosmos_predict_dataset != "disable":
@@ -835,7 +917,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         "--embedding-algorithm",
         type=str,
         default="internvideo2",
-        choices=["cosmos-embed1-224p", "cosmos-embed1-336p", "cosmos-embed1-448p", "internvideo2", "openai"],
+        choices=["cosmos-embed1-224p", "cosmos-embed1-336p", "cosmos-embed1-448p", "cradio", "internvideo2", "openai"],
         help="Embedding algorithm to use.",
     )
     parser.add_argument(
@@ -1324,7 +1406,11 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         choices=[
             "default",
             "av",
+            "av-multiview",
             "av-surveillance",
+            "agibot",
+            "inhard",
+            "youcook2",
         ],
         help="Prompt variant for captioning algorithm.",
     )
@@ -1489,6 +1575,18 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
             "vLLM performance mode. 'throughput' (default) favors aggregate tokens/sec with "
             "larger CUDA graphs and more aggressive batching. 'interactivity' favors low "
             "per-request latency. 'balanced' is the vLLM default."
+        ),
+    )
+    parser.add_argument(
+        "--multi-view",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable multi-view captioning. Groups videos by scene ID (parsed from filenames "
+            "matching '<scene_id>_CAM_<NAME>.mp4') and passes CAM_FRONT_LEFT, CAM_FRONT, and "
+            "CAM_FRONT_RIGHT together to the captioning model in a single inference call. "
+            "The resulting scene-level caption is stored on the CAM_FRONT clip only. "
+            "Recommended to use with --captioning-prompt-variant av-multiview."
         ),
     )
     parser.add_argument(
@@ -1680,6 +1778,121 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         type=str,
         default="front",
         help="String to identify the primary camera in session discovery; the matching video is placed at slot 0.",
+    )
+    # ── Evaluation / judging ────────────────────────────────────────────────
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        default=False,
+        help="Add a JudgePhase that scores generated captions against ground truth.",
+    )
+    parser.add_argument(
+        "--dual-judge",
+        action="store_true",
+        default=False,
+        help=(
+            "When --evaluate is set, run both gemma4_e4b (text) and vci_7b (mp4-bytes) judges "
+            "sequentially. Overrides --judge-model and --judge-models."
+        ),
+    )
+    parser.add_argument(
+        "--judge-models",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of judge variants to run sequentially (e.g. "
+            "gemma4_e4b,gemma4_e4b_video). Overrides --judge-model. "
+            "Ignored when --dual-judge is set."
+        ),
+    )
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default="gemma4_e4b",
+        help="Judge plugin variant to use (see cosmos_curate/models/judge_interface.py).",
+    )
+    parser.add_argument(
+        "--judge-caption-source",
+        type=str,
+        default=None,
+        help="Which Window.caption[key] to judge. Defaults to --captioning-algorithm.",
+    )
+    parser.add_argument(
+        "--judge-prompt-variant",
+        type=str,
+        default="lenient_binary",
+        help="Prompt template name for the judge (see evaluation/prompts.py).",
+    )
+    parser.add_argument(
+        "--judge-prompt-text",
+        type=str,
+        default=None,
+        help="Override judge prompt text (must contain {gt_action_text} and {caption_text}).",
+    )
+    parser.add_argument(
+        "--judge-batch-size",
+        type=int,
+        default=8,
+        help="Per-call batch size sent to the judge plugin.",
+    )
+    parser.add_argument(
+        "--judge-max-new-tokens",
+        type=int,
+        default=32,
+        help="Max output tokens for generative judges.",
+    )
+    parser.add_argument(
+        "--judge-gt-source",
+        type=str,
+        default="agibot",
+        help="GT source plugin name (agibot | manual | youcook2 | nuscenes | inhard_online | none).",
+    )
+    parser.add_argument(
+        "--judge-gt-task-info-dir",
+        type=str,
+        default=None,
+        help="For --judge-gt-source=agibot: directory containing task_<id>.json files.",
+    )
+    parser.add_argument(
+        "--judge-gt-annotation-path",
+        type=str,
+        default=None,
+        help="For --judge-gt-source=manual: path to annotation_*_ground_truth.json.",
+    )
+    parser.add_argument(
+        "--judge-gt-captions-path",
+        type=str,
+        default=None,
+        help="For --judge-gt-source=youcook2: path to gt_captions.json.",
+    )
+    parser.add_argument(
+        "--judge-gt-scene-json-path",
+        type=str,
+        default=None,
+        help="For --judge-gt-source=nuscenes: path to scene.json from a nuScenes v1.0 metadata dir.",
+    )
+    parser.add_argument(
+        "--judge-gt-labels-dir",
+        type=str,
+        default=None,
+        help="For --judge-gt-source=inhard_online: directory containing .anvil annotation files.",
+    )
+    # ── GT-window captioning ────────────────────────────────────────────────
+    parser.add_argument(
+        "--gt-windows-source",
+        type=str,
+        default=None,
+        help=(
+            "Use GT action frame ranges as caption windows instead of TransNetV2 windowing. "
+            "Registered sources: agibot. When set, --splitting-algorithm is forced to "
+            "'fixed-stride' with a 1-hour clip duration so the whole video is one clip."
+        ),
+    )
+    parser.add_argument(
+        "--gt-windows-task-info-dir",
+        type=str,
+        default=None,
+        help="Directory containing task_<id>.json files (required when --gt-windows-source is set).",
     )
     # add common args applicable to all pipelines
     add_common_args(parser)

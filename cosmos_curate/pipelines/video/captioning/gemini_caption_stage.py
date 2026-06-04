@@ -266,7 +266,7 @@ class GeminiCaptionStage(CuratorStage):
 
         @tenacity.retry(
             stop=tenacity.stop_after_attempt(self._max_caption_retries),
-            wait=tenacity.wait_fixed(self._retry_delay_seconds),
+            wait=tenacity.wait_exponential(multiplier=self._retry_delay_seconds, min=self._retry_delay_seconds, max=60),
             retry=tenacity.retry_if_exception(GeminiCaptionStage._should_retry_exception),
             reraise=True,
         )

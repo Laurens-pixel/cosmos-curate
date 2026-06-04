@@ -28,3 +28,24 @@ ci_secrets.env
 /run-benchmark.sh
 /cosmos-cookbook/
 
+# ---- HPC / local workspace (never commit) ----
+*.sif
+cosmos_curate_local_workspace/
+test_videos/
+nuscenes_videos/
+nuscenes_raw/
+agibot_alpha/
+agibot_head_*/
+agibot_run_logs/
+.config/
+curator/
+eval_stage/
+scripts/
+*.log
+slurm-*.out
+cgroup_mem_*.log
+paper_plan.*
+nuscenes_to_video.py
+download_*.py
+download_*.sh
+

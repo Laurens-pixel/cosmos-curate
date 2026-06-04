@@ -33,7 +33,7 @@ GPU_MEMORY_UTILIZATION = 0.85
 MAX_NUM_BATCHED_TOKENS = 32768
 DEFAULT_BATCH_SIZE = 16
 TRUST_REMOTE_CODE = False
-LIMIT_MM_PER_PROMPT = {"images": 0, "video": 1}
+LIMIT_MM_PER_PROMPT = {"images": 0, "video": 3}
 
 _DEFAULT_REFINE_PROMPT = """
 Improve and refine following video description. Focus on highlighting the key visual and sensory elements.
@@ -58,6 +58,7 @@ class QwenMessage(TypedDict):  # noqa: D101
 def make_message(
     text_input: str,
 ) -> QwenMessage:
+    # single-video variant (see make_multiview_message for multi-video)
     """Create a message for the Qwen model.
 
     Args:
@@ -74,6 +75,27 @@ def make_message(
             QwenContentTypeText(type="text", text=text_input),
         ],
     )
+
+
+def make_multiview_message(
+    text_input: str,
+    num_views: int = 3,
+) -> QwenMessage:
+    """Create a multi-video message for Qwen, with one video token per camera view.
+
+    Args:
+        text_input: The text prompt describing all views.
+        num_views: Number of video inputs (default 3: left, front, right).
+
+    Returns:
+        A message with num_views video content entries followed by the text prompt.
+
+    """
+    content: list[QwenContentType | QwenContentTypeText] = [
+        QwenContentType(type="video") for _ in range(num_views)
+    ]
+    content.append(QwenContentTypeText(type="text", text=text_input))
+    return QwenMessage(role="user", content=content)
 
 
 def make_prompt(
@@ -171,8 +193,30 @@ class VllmQwen(VllmPlugin):
             A dictionary containing the LLM inputs.
 
         """
-        message = make_message(prompt)
-        return make_prompt(message, frames, processor)
+        message = make_message(prompt)  # builds the chat message structure: [{type: "video"}, {type: "text", text: prompt}]
+        return make_prompt(message, frames, processor) # tokenizes the prompt and returns the prompt_token_ids and multi_modal_data(frame tensors)
+
+    @staticmethod
+    def make_multiview_llm_input(
+        prompt: str,
+        frames_list: list[torch.Tensor],
+        processor: AutoProcessor,
+    ) -> dict[str, Any]:
+        """Make LLM inputs for multi-view (multi-video) captioning.
+
+        Args:
+            prompt: The text prompt describing all camera views.
+            frames_list: List of frame tensors, one per camera view.
+                         Expected order: [CAM_FRONT_LEFT, CAM_FRONT, CAM_FRONT_RIGHT].
+                         Each tensor has shape [num_frames, C, H, W].
+            processor: The AutoProcessor to use for the LLM.
+
+        Returns:
+            A dictionary containing the LLM inputs with all views as separate videos.
+
+        """
+        message = make_multiview_message(prompt, num_views=len(frames_list))
+        return make_prompt(message, frames_list, processor)
 
     @staticmethod
     def make_refined_llm_request(

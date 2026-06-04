@@ -144,8 +144,12 @@ def _summarize_perf_stats(
 ) -> dict[str, dict[str, float]]:
     data = {}
     if len(task_stats) > 0:
-        for stage in task_stats[0]:
-            data[stage] = sum((x[stage] for x in task_stats), StagePerfStats()).to_dict()
+        all_stages: set[str] = set()
+        for t in task_stats:
+            all_stages.update(t.keys())
+        _zero = StagePerfStats()
+        for stage in sorted(all_stages):
+            data[stage] = sum((x.get(stage, _zero) for x in task_stats), StagePerfStats()).to_dict()
     return data
 
 

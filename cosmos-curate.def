@@ -1,0 +1,152 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/cuda:12.9.1-devel-ubuntu24.04
+
+%labels
+    Author NVIDIA Cosmos-Curate (Apptainer build)
+    Version 1.0.0
+
+%environment
+    # Driver capabilities
+    export NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+    export TZ=America/Los_Angeles
+
+    # CUDA / ML build flags
+    export AM_I_DOCKER=True
+    export BUILD_WITH_CUDA=True
+    export TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;10.0+PTX"
+    export CUDA_HOME="/usr/local/cuda"
+    export XFORMERS_IGNORE_FLASH_VERSION_CHECK="1"
+    export VLLM_WORKER_MULTIPROC_METHOD="spawn"
+    export VLLM_USE_V1="1"
+
+    # Ray configuration
+    export RAY_DEDUP_LOGS=0
+    export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+    export RAY_MAX_LIMIT_FROM_API_SERVER=40000
+    export RAY_MAX_LIMIT_FROM_DATA_SOURCE=40000
+    export RAY_DEFAULT_OBJECT_STORE_MAX_MEMORY_BYTES=800000000000
+    export RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION=0.4
+    export RAY_gcs_rpc_server_connect_timeout_s=30
+    export RAY_gcs_rpc_server_reconnect_timeout_s=180
+    export RAY_WARN_BLOCKING_GET_INSIDE_ASYNC=0
+    export XENNA_RAY_METRICS_PORT=9002
+
+    # boto3
+    export AWS_REQUEST_CHECKSUM_CALCULATION='when_required'
+
+    # Workspace and model cache paths (inside container)
+    export DEFAULT_WORKSPACE_LOC="/config/default_workspace"
+    export HF_HOME="/config/default_workspace/weights/hf_home/"
+    export LAION_CACHE_HOME="/config/default_workspace/weights/laion_cache/"
+
+    # FFmpeg / pixi on PATH
+    export PATH="/usr/local/bin:$PATH"
+    export LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
+
+%post
+    # ----------------------------------------------------------------
+    # 1. System packages
+    # ----------------------------------------------------------------
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y \
+        libsm6 libxext6 \
+        ca-certificates \
+        wget \
+        git \
+        rsync \
+        --option=Dpkg::Options::=--force-confdef \
+        && update-ca-certificates \
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/*
+
+    # ----------------------------------------------------------------
+    # 2. GPU-accelerated FFmpeg (also needed for opencv)
+    # ----------------------------------------------------------------
+    export FFMPEG_VERSION=7.0.1
+    export NVCODEC_VERSION=12.1.14.0
+
+    mkdir -p /tmp && chmod 1777 /tmp
+    apt-get update && apt-get install -y \
+        libcrypt-dev autoconf automake build-essential cmake \
+        libaom-dev libass-dev libdav1d-dev libdrm-dev libfreetype6-dev \
+        libgnutls28-dev libnuma-dev libopenh264-dev libtool libva-dev \
+        libvorbis-dev libvpx-dev libwebp-dev pkg-config texinfo vainfo \
+        yasm zlib1g-dev
+
+    # nv-codec-headers
+    wget -O /tmp/nv-codec-headers.tar.gz \
+        "https://github.com/FFmpeg/nv-codec-headers/releases/download/n${NVCODEC_VERSION}/nv-codec-headers-${NVCODEC_VERSION}.tar.gz"
+    tar xzvf /tmp/nv-codec-headers.tar.gz -C /tmp/
+    cd /tmp/nv-codec-headers-${NVCODEC_VERSION} && make && make install
+
+    # FFmpeg with CUDA support
+    wget -O /tmp/ffmpeg-snapshot.tar.bz2 \
+        "https://www.ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.bz2"
+    tar xjvf /tmp/ffmpeg-snapshot.tar.bz2 -C /tmp/
+    cd /tmp/ffmpeg-${FFMPEG_VERSION}
+    PATH="/usr/local/cuda/bin:$PATH" \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-nonfree \
+        --enable-cuda-nvcc \
+        --enable-libnpp \
+        --enable-libopenh264 \
+        --enable-libaom \
+        --enable-libdav1d \
+        --enable-libvorbis \
+        --enable-libvpx \
+        --enable-libwebp \
+        --enable-vaapi \
+        --extra-cflags=-I/usr/local/cuda/include \
+        --extra-ldflags=-L/usr/local/cuda/lib64 \
+        --extra-libs=-lpthread \
+        --extra-libs=-lm \
+        --disable-static \
+        --enable-shared \
+        --disable-doc \
+        --disable-debug
+    make -j$(nproc) && make install && ldconfig
+
+    # Cleanup FFmpeg build
+    cd / && rm -rf /tmp/ffmpeg* /tmp/nv-codec-headers*
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    # ----------------------------------------------------------------
+    # 3. Install Pixi
+    # ----------------------------------------------------------------
+    wget -qO- https://pixi.sh/install.sh | PIXI_HOME=/usr/local PIXI_NO_PATH_UPDATE=1 sh
+
+    # ----------------------------------------------------------------
+    # 4. Set up code directory and copy pixi config
+    # ----------------------------------------------------------------
+    mkdir -p /opt/cosmos-curate
+
+    # ----------------------------------------------------------------
+    # 5. Install pixi environments (except cuml)
+    #    Envs: default, legacy-transformers, model-download, transformers, unified
+    # ----------------------------------------------------------------
+    cd /opt/cosmos-curate
+    export CONDA_OVERRIDE_CUDA=12.9.1
+    pixi install -e default -e legacy-transformers -e model-download -e transformers -e unified --frozen
+    pixi clean cache -y
+
+    # ----------------------------------------------------------------
+    # 6. Install cuml environment separately (very large, >20GB)
+    # ----------------------------------------------------------------
+    cd /opt/cosmos-curate
+    export CONDA_OVERRIDE_CUDA=12.9.1
+    pixi install -e cuml --frozen
+    pixi clean cache -y
+
+%files
+    # Copy pixi config files into the container
+    pixi.toml /opt/cosmos-curate/pixi.toml
+    pixi.lock /opt/cosmos-curate/pixi.lock
+    # Copy source code
+    cosmos_curate /opt/cosmos-curate/cosmos_curate
+    tests /opt/cosmos-curate/tests
+    pytest.ini /opt/cosmos-curate/pytest.ini
+    .coveragerc /opt/cosmos-curate/.coveragerc
+
+%runscript
+    exec pixi run "$@"

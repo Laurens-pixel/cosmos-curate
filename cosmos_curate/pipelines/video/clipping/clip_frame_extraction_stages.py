@@ -16,6 +16,7 @@
 """Clip Frame Extraction Stage."""
 
 import io
+import time
 import math
 from functools import reduce
 from typing import TYPE_CHECKING
@@ -92,7 +93,7 @@ class ClipFrameExtractionStage(CuratorStage):
         return CuratorStageResource(cpus=self._num_cpus)
 
     def lcm_multiple(self, fps: list[float | int]) -> float | int:
-        """Compute LCM of a list of fps targets."""
+        """Compute LCM(Least Common Multiple) of a list of fps targets."""
 
         def lcm(a: float, b: float) -> float | int:
             return abs(a * b) // math.gcd(int(a), int(b))
@@ -178,12 +179,14 @@ class ClipFrameExtractionStage(CuratorStage):
         for task in tasks:
             self._timer.reinit(self, task.get_major_size())
             for video in task.videos:
+                video.stage_timestamps["ClipFrameExtractionStage_start"] = time.time()
                 with self._timer.time_process():
                     try:
                         self._process_video(video)
                     except Exception as e:  # noqa: BLE001
                         logger.exception(f"Error processing video {video.input_video}")
                         video.errors[self.__class__.__name__] = str(e)
+                video.stage_timestamps["ClipFrameExtractionStage_end"] = time.time()
 
             if self._log_stats:
                 stage_name, stage_perf_stats = self._timer.log_stats()

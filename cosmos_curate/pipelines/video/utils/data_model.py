@@ -136,6 +136,8 @@ class Window:
     # `caption: {model_name: caption}`
     caption: dict[str, str] = attrs.Factory(dict)
     enhanced_caption: dict[str, str] = attrs.Factory(dict)
+    # Judge results: judge_variant -> {verdict, score, explanation, gt_action_text, raw_output, ...}
+    judge: dict[str, dict[str, Any]] = attrs.Factory(dict)
     # t5_xxl embeddings for this window
     t5_xxl_embedding: dict[str, npt.NDArray[np.int32]] = attrs.Factory(dict)
     # webp preview; wrapped in LazyData for zero-copy inter-stage transport
@@ -183,6 +185,8 @@ class Clip:
     intern_video_2_frames: LazyData[npt.NDArray[np.float32]] = attrs.field(factory=LazyData, converter=LazyData.coerce)  # type: ignore[misc]
     intern_video_2_embedding: npt.NDArray[np.float32] | None = None
     openai_embedding: npt.NDArray[np.float32] | None = None
+    cradio_frames: npt.NDArray[np.float32] | None = None
+    cradio_embedding: npt.NDArray[np.float32] | None = None
     # captioning
     windows: list[Window] = attrs.Factory(list)
     filter_windows: list[Window] = attrs.Factory(list)
@@ -264,6 +268,10 @@ class Clip:
             total_size += self.cosmos_embed1_embedding.nbytes
         if self.openai_embedding is not None:
             total_size += self.openai_embedding.nbytes
+        if self.cradio_frames is not None:
+            total_size += self.cradio_frames.nbytes
+        if self.cradio_embedding is not None:
+            total_size += self.cradio_embedding.nbytes
         for window in self.windows:
             total_size += window.get_major_size()
         return total_size
@@ -360,6 +368,10 @@ class Video:
     clip_chunk_index: int = 0
     # for last writer stage
     clip_stats: ClipStats = attrs.Factory(ClipStats)
+    # per-video pipeline timing (unix timestamps set by VideoDownloader and ClipWriterStage)
+    pipeline_start_ts: float | None = None
+    # per-stage entry/exit timestamps: {"StageName_start": ts, "StageName_end": ts, ...}
+    stage_timestamps: dict[str, float] = attrs.Factory(dict)
     # for debugging
     errors: dict[str, str] = attrs.Factory(dict)
     # True if VideoDownloader remuxed this video (mpegts → mp4). Set once per source

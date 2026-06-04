@@ -15,6 +15,7 @@
 """Clip extraction stages."""
 
 import copy
+import time
 import pathlib
 import subprocess
 import uuid
@@ -280,25 +281,94 @@ class ClipTranscodingStage(CuratorStage):
         """
         for task in tasks:
             self._timer.reinit(self, task.get_major_size())
-            for video in task.videos:
-                with self._timer.time_process(
-                    len(video.clips),
-                    video.metadata.duration if video.metadata.duration else 0,
-                ):
-                    try:
-                        self._process_video(video)
-                    except Exception as e:  # noqa: BLE001
-                        logger.exception(f"Error processing video {video.input_video}")
-                        video.errors[self.__class__.__name__] = str(e)
+            video = task.video
+            video.stage_timestamps["ClipTranscodingStage_start"] = time.time()
+            if video.encoded_data is None:
+                error_msg = "Please load video!"
+                raise ValueError(error_msg)
+            with self._timer.time_process(
+                len(video.clips),
+                video.metadata.duration if video.metadata.duration else 0,
+            ):
+                if not video.clips:
+                    logger.warning(f"No clips to transcode for {video.input_video}. Skipping...")
+                    video.encoded_data = None
+                    continue
+                with make_pipeline_temporary_dir(sub_dir="transcode") as tmp_dir:
+                    # write video to file
+                    video_file = tmp_dir / "input.mp4"
+                    video_file.write_bytes(video.encoded_data.resolve())
+                    force_pix_fmt = video.is_10_bit_color() or False
 
-                video.encoded_data.drop()
+                    # use input video bit-rate
+                    use_bit_rate = None
+                    if self._use_input_bit_rate:
+                        use_bit_rate = str(video.metadata.bit_rate_k) + "K"
+
+                    # extract clips in batches
+                    for i in range(0, len(video.clips), self._encode_batch_size):
+                        batch = video.clips[i : i + self._encode_batch_size]
+                        self._extract_clips(
+                            tmp_dir,
+                            video_file.name,
+                            force_pix_fmt=force_pix_fmt,
+                            use_bit_rate=use_bit_rate,
+                            clips=batch,
+                            input_video=str(video.input_video),
+                        )
+            # we are done with encoded_data
+            video.encoded_data = None
+            video.stage_timestamps["ClipTranscodingStage_end"] = time.time()
 
             if self._log_stats:
                 stage_name, stage_perf_stats = self._timer.log_stats()
                 task.stage_perf[stage_name] = stage_perf_stats
 
-        # chunk tasks into subtasks, guaranteed to be time-aligned
-        return chunk_tasks(tasks, self._num_clips_per_chunk, verbose=self._verbose)
+        output_tasks = []
+        for task in tasks:
+            # consider cracking into smaller chunks of clips
+            clip_durations = [x.duration for x in task.video.clips]
+            if len(clip_durations) > 0:
+                logger.info(
+                    f"video {task.video.input_video} has {len(task.video.clips)} "
+                    f"clips and weight={task.weight:.2f}; "
+                    f"min-clip={min(clip_durations):.2f}s, "
+                    f"max-clip={max(clip_durations):.1f}s.",
+                )
+            clip_chunks = list(
+                grouping.split_by_chunk_size(
+                    task.video.clips,
+                    self._num_clips_per_chunk * 8,
+                    lambda x: int(x.span[1] - x.span[0]),
+                ),
+            )
+            for idx in range(len(clip_chunks)):
+                subtask = SplitPipeTask(
+                    video=Video(
+                        input_video=task.video.input_video,
+                        metadata=task.video.metadata,
+                        clips=clip_chunks[idx],
+                        num_total_clips=len(task.video.clips),
+                        num_clip_chunks=len(clip_chunks),
+                        clip_chunk_index=idx,
+                        pipeline_start_ts=task.video.pipeline_start_ts,
+                        stage_timestamps=dict(task.video.stage_timestamps),
+                        errors=copy.deepcopy(task.video.errors),
+                    ),
+                    stage_perf=copy.deepcopy(task.stage_perf),
+                    session_id=task.session_id,
+                )
+                if idx > 0:
+                    for stats in subtask.stage_perf.values():
+                        stats.reset()
+                if self._verbose:
+                    logger.info(
+                        f"Spawning subtask {idx} with {len(subtask.video.clips)} clips and weight={subtask.weight:.2f}",
+                    )
+                output_tasks.append(subtask)
+            logger.info(f"Creating {len(clip_chunks)} tasks for downstream from {task.video.input_video}.")
+
+        return output_tasks
 
     @property
     def resources(self) -> CuratorStageResource:

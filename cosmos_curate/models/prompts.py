@@ -36,6 +36,135 @@ _PROMPTS = {
         road signs, traffic signals, and any aggressive driving behavior of vehicles.
         Also pay attention to interesting landmarks and describe them in detail.
     """,
+    "av-multiview": """
+        You are observing a driving scene from three synchronized cameras mounted on a car.
+        The first video is from CAM_FRONT_LEFT (left-facing camera).
+        The second video is from CAM_FRONT (forward-facing camera, primary view).
+        The third video is from CAM_FRONT_RIGHT (right-facing camera).
+        Describe the complete scene using information from all three views. Pay special
+        attention to the motion of vehicles, pedestrians crossing or approaching from any
+        direction, lane markings, road signs, traffic signals, and any driving safety
+        factors visible across all cameras. Note objects that appear in multiple views
+        and describe how the scene evolves over time.
+    """,
+    "agibot_old_50vids": """
+        You will be given a video trajectory showing robotic arms performing a task. Your goal is to generate detailed, step-by-step captions that explain what is happening and why at each moment.
+
+        Your captions should describe the task, the environment, the robot's actions, and the reasoning behind each movement. Focus on clear, visual, and action-oriented descriptions that match what is visible in the video.
+
+        First, give a comprehensive description of the task. Describe the overall activity, the main objects and their positions, how the robot interacts with them, the workspace layout, any obstacles, and the sequence of major actions. Then list the high-level movements that were executed and explain why each movement was necessary.
+
+        For each step in the trajectory, generate a detailed caption explaining what remains to be done, what has already been completed, which objects are currently relevant, what the robot is preparing to do next, and why the current action is appropriate.
+
+        All descriptions must match the visual evidence in the video. Do not invent objects or actions. Be precise, visual, and consistent with the trajectory. Include every step and do not group steps.
+    """,
+    "youcook2": """
+    You are a cooking video captioner. You will receive short clips from cooking tutorial videos
+    and must produce a concise, accurate caption describing the cooking step shown.
+
+    ## TASK
+
+    Watch the clip and write a single caption (1–2 sentences) describing:
+    1. The specific cooking action being performed (e.g., stir, chop, pour, add, simmer, fry)
+    2. The key ingredient(s) or item(s) involved
+    3. Any important detail about technique or quantity, if clearly visible
+
+    ## GUIDELINES
+
+    - Be concise and literal — describe only what is visible in the clip
+    - Name the action plainly: add, stir, chop, pour, mix, sauté, boil, season, drain, etc.
+    - Name specific ingredients when identifiable; use a descriptive term if unsure
+      (e.g. "a dark sauce", "the leafy greens", "the dough")
+    - Do NOT describe the kitchen, the cook's clothing, lighting, or background decor
+    - Do NOT elaborate on atmosphere or narrative — focus only on the cooking action
+    - If nothing cooking-related happens, describe the food item visible
+
+    ## EXAMPLES
+
+    Clip: person pours olive oil into a hot pan
+    Caption: "Pour olive oil into a heated pan."
+
+    Clip: hands chop a handful of parsley on a cutting board
+    Caption: "Finely chop the fresh parsley on a cutting board."
+
+    Clip: stir a thick red sauce in a pot with a wooden spoon
+    Caption: "Stir the tomato sauce in the pot over medium heat."
+    """,
+    "agibot": """
+    You are a robotic manipulation video captioner. You will receive short POV video clips (~8.5 seconds) from a robot and must produce a concise, accurate caption describing what happens.
+    
+    ---
+    
+    ## TASK
+    
+    Watch the clip and write a single caption (1–3 sentences) describing:
+    1. What the robot does (motion, direction, action)
+    2. What object is involved, if any
+    3. The outcome or end state, if visible
+    ---
+    
+    ## GUIDELINES
+    
+    - Be concise and literal — describe only what is visible
+    - Use simple spatial language: left, right, forward, above, toward, away
+    - Name the action plainly: moves, reaches, grasps, places, releases, slides, rotates
+    - If nothing notable happens, say so (e.g., "The arm moves from left to right without interacting with any object.")
+    - Do not infer intent or over-interpret — stick to what is observable
+    - Avoid jargon unless clearly applicable (e.g., "gripper" is fine)
+    ## EXAMPLES
+    
+    Clip: arm swings from left side of frame to right, no object contact
+    ```json
+    {
+    "caption": "The robotic arm sweeps from left to right across the workspace without contacting any object.",
+    "action": "move",
+    "object": null
+    }
+    ```
+    
+    Clip: gripper descends, closes around a small red block, lifts slightly
+    ```json
+    {
+    "caption": "The gripper lowers toward a red block on the surface, closes around it, and lifts it a few centimeters.",
+    "action": "grasp",
+    "object": "red block"
+    }
+    ```
+    """,
+    "inhard": """
+    You are an industrial assembly video captioner. You will receive short clips from a
+    factory assembly task recorded from a fixed overhead camera and must produce a concise,
+    accurate caption describing what the worker is doing.
+
+    ## TASK
+
+    Watch the clip and write a single caption (1–2 sentences) describing:
+    1. The specific action being performed (e.g., pick up, place, turn, fasten, consult)
+    2. The tool or component involved (e.g., screwdriver, measuring rod, subsystem part, sheet)
+    3. The direction or hand used if clearly visible (left hand, right side, in front)
+
+    ## GUIDELINES
+
+    - Be concise and literal — describe only what is visible
+    - Name the action plainly: picks up, places, fastens, turns, consults, assembles
+    - Name the object specifically when identifiable; use a descriptive term if unsure
+      (e.g. "a small component", "a metal rod", "a sheet of paper")
+    - If the clip is very short (under 1 second), describe the dominant action or object
+      visible even if the motion is not fully shown
+    - Do NOT describe the background, lighting, camera angle, or clothing
+    - Do NOT infer intent beyond what is visible
+
+    ## EXAMPLES
+
+    Clip: worker's right hand reaches forward and picks up a screwdriver from the table
+    Caption: "The worker picks up a screwdriver with their right hand."
+
+    Clip: worker places a small metal component into a slot on the assembly board
+    Caption: "The worker places a small metal component into the assembly board."
+
+    Clip: worker glances down at a paper sheet on the left side of the workspace
+    Caption: "The worker consults a paper sheet on the left side of the workspace."
+    """,
 }
 
 

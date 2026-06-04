@@ -25,6 +25,10 @@ from cosmos_curate.pipelines.video.embedding.cosmos_embed1_stages import (
     CosmosEmbed1EmbeddingStage,
     CosmosEmbed1FrameCreationStage,
 )
+from cosmos_curate.pipelines.video.embedding.cradio_stages import (
+    CRadioEmbeddingStage,
+    CRadioFrameCreationStage,
+)
 from cosmos_curate.pipelines.video.embedding.internvideo2_stages import (
     InternVideo2EmbeddingStage,
     InternVideo2FrameCreationStage,
@@ -80,6 +84,13 @@ class EmbeddingPhase(CurationPhase):
         cfg = self._cfg
         if cfg.algorithm == "internvideo2":
             return InternVideo2EmbeddingStage(
+                num_gpus_per_worker=cfg.gpus_per_worker,
+                batch_size=cfg.batch_size,
+                verbose=cfg.verbose,
+                log_stats=cfg.perf_profile,
+            )
+        if cfg.algorithm == "cradio":
+            return CRadioEmbeddingStage(
                 num_gpus_per_worker=cfg.gpus_per_worker,
                 batch_size=cfg.batch_size,
                 verbose=cfg.verbose,
@@ -147,6 +158,12 @@ class EmbeddingPhase(CurationPhase):
         frame_stage: CuratorStage
         if cfg.algorithm == "internvideo2":
             frame_stage = InternVideo2FrameCreationStage(
+                target_fps=cfg.target_fps,
+                verbose=cfg.verbose,
+                log_stats=cfg.perf_profile,
+            )
+        elif cfg.algorithm == "cradio":
+            frame_stage = CRadioFrameCreationStage(
                 target_fps=cfg.target_fps,
                 verbose=cfg.verbose,
                 log_stats=cfg.perf_profile,

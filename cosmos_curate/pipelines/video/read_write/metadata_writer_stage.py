@@ -19,6 +19,7 @@ import io
 import json
 import pathlib
 import pickle
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -226,6 +227,8 @@ class ClipWriterStage(CuratorStage):
             return ClipWriterStage._get_output_path(output_path, "ce1_embd")
         if embedding_algorithm == "openai":
             return ClipWriterStage._get_output_path(output_path, "openai_embd")
+        if embedding_algorithm == "cradio":
+            return ClipWriterStage._get_output_path(output_path, "cradio_embd")
         # should not happen
         logger.error(f"Unknown embedding algorithm: {embedding_algorithm}")
         return ClipWriterStage._get_output_path(output_path, f"{embedding_algorithm}_embd")
@@ -424,12 +427,14 @@ class ClipWriterStage(CuratorStage):
                 clip.intern_video_2_embedding = None
                 clip.cosmos_embed1_embedding = None
                 clip.openai_embedding = None
+                clip.cradio_embedding = None
                 for window in clip.windows:
                     window.mp4_bytes.drop()
                     for model_variant in window.model_input:
                         del window.model_input[model_variant]
                     window.caption.clear()
                     window.enhanced_caption.clear()
+                    window.judge.clear()
                     window.webp_bytes.drop()
 
     def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask] | None:  # type: ignore[override]
@@ -669,6 +674,8 @@ class ClipWriterStage(CuratorStage):
             return clip.cosmos_embed1_embedding
         if self._embedding_algorithm == "openai":
             return clip.openai_embedding
+        if self._embedding_algorithm == "cradio":
+            return clip.cradio_embedding
         return None
 
     def _add_clip_embedding_to_buffer(self, clip: Clip) -> None:
@@ -772,6 +779,9 @@ class ClipWriterStage(CuratorStage):
             for model in self._enhanced_caption_models:
                 if model in window.enhanced_caption:
                     curr_window[f"{model}_enhanced_caption"] = window.enhanced_caption[model]
+            # Judge results — keyed by judge variant for symmetry with the captions above.
+            if window.judge:
+                curr_window["judge"] = dict(window.judge)
             data["windows"].append(curr_window)
         data["valid"] = bool(clip.encoded_data and len(clip.windows) > 0)
         data["has_caption"] = has_caption
@@ -859,6 +869,9 @@ class ClipWriterStage(CuratorStage):
                 "num_total_clips": video.num_total_clips,
                 "num_clip_chunks": video.num_clip_chunks,
                 "video_uuid": self.get_video_uuid(input_video_path),
+                "pipeline_start_ts": video.pipeline_start_ts,
+                "pipeline_end_ts": time.time(),
+                "stage_timestamps": video.stage_timestamps,
             }
             dest = self._get_video_uri(input_video_path)
             self._write_json_data(data, dest, "video metadata", input_video_path)
@@ -881,11 +894,13 @@ class ClipWriterStage(CuratorStage):
             "filtered_clips": [str(clip.uuid) for clip in video.filtered_clips],
             "all_windows": {},
             "all_windows_enhanced_caption": {},
+            "all_windows_judge": {},
         }
         for clip in video.clips:
             clip_uuid = str(clip.uuid)
             data["all_windows"][clip_uuid] = {}
             data["all_windows_enhanced_caption"][clip_uuid] = {}
+            data["all_windows_judge"][clip_uuid] = {}
             for window in clip.windows:
                 window_key = f"{window.start_frame}_{window.end_frame}"
                 # Try each caption model in order, using the first one available.
@@ -898,6 +913,9 @@ class ClipWriterStage(CuratorStage):
                     if model in window.enhanced_caption:
                         data["all_windows_enhanced_caption"][clip_uuid][window_key] = window.enhanced_caption[model]
                         break
+                # Judge results — keep all variants present on the window (judge_variant -> record).
+                if window.judge:
+                    data["all_windows_judge"][clip_uuid][window_key] = dict(window.judge)
         dest = self._get_clip_chunk_uri(input_video_path, video.clip_chunk_index)
         self._write_json_data(data, dest, "clip chunk metadata", input_video_path)
 
