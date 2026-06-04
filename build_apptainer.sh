@@ -6,15 +6,20 @@
 #   export APPTAINER_DOCKER_PASSWORD='<your-NGC-API-key>'
 #   bash build_apptainer.sh
 #
-# The resulting image is written to /projects/0/prjs0951/Sem/cosmos-curate.sif
+# The resulting image is written to <your-project-dir>/cosmos-curate.sif
+# Set PROJECT_DIR below before running.
 #
 # Safety: monitors home directory quota and kills the build if it increases
 # by more than 0.5%, to protect against unexpected writes to $HOME.
+# Note: quota monitoring uses the `myquota` command (Snellius-specific).
+# Remove or replace get_home_quota_pct / get_work4_inodes_pct if your cluster
+# uses a different quota tool.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIF_PATH="/projects/0/prjs0951/Sem/cosmos-curate.sif"
+PROJECT_DIR="${PROJECT_DIR:-${SCRIPT_DIR}}"   # override with: PROJECT_DIR=/your/path bash build_apptainer.sh
+SIF_PATH="${PROJECT_DIR}/cosmos-curate.sif"
 DEF_PATH="${SCRIPT_DIR}/cosmos-curate.def"
 MAX_HOME_QUOTA_INCREASE="0.5"
 MAX_WORK4_INODES_PCT="96.5"
@@ -31,16 +36,18 @@ fi
 # Helper: read current home quota usage percentage
 # ----------------------------------------------------------------
 get_home_quota_pct() {
-    myquota prjs0951 2>/dev/null \
-        | grep -A 3 "cmeo@home1" \
+    # Snellius: myquota <project> | grep home line
+    # Replace with your cluster's quota command if different
+    myquota "${QUOTA_PROJECT:-}" 2>/dev/null \
+        | grep -A 3 "home" \
         | grep "GiB" \
         | grep -oP '\d+\.\d+(?=%)' \
         | head -1
 }
 
 get_work4_inodes_pct() {
-    myquota prjs0951 2>/dev/null \
-        | grep -A 4 "prjs0951@wstor_work4" \
+    myquota "${QUOTA_PROJECT:-}" 2>/dev/null \
+        | grep -A 4 "wstor_work4\|scratch\|work" \
         | grep "Inodes" \
         | grep -oP '\d+\.\d+(?=%)' \
         | head -1
@@ -64,8 +71,8 @@ echo ""
 # ----------------------------------------------------------------
 # Redirect all Apptainer dirs into the project to avoid $HOME writes
 # ----------------------------------------------------------------
-export APPTAINER_TMPDIR="/projects/0/prjs0951/Sem/.apptainer_tmp"
-export APPTAINER_CACHEDIR="/projects/0/prjs0951/Sem/.apptainer_cache"
+export APPTAINER_TMPDIR="${PROJECT_DIR}/.apptainer_tmp"
+export APPTAINER_CACHEDIR="${PROJECT_DIR}/.apptainer_cache"
 mkdir -p "${APPTAINER_TMPDIR}" "${APPTAINER_CACHEDIR}"
 
 echo "Building Apptainer image..."

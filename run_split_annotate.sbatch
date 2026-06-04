@@ -21,12 +21,12 @@
 ##SBATCH --partition=<your_gpu_partition>
 ##SBATCH --gres=gpu:4
 ##SBATCH --time=08:00:00
-#SBATCH --output=/projects/0/prjs0951/Sem/logs/%x_%j.log
+##SBATCH --output=<your_project_dir>/logs/%x_%j.log
 
 # ============================================================
 # PATH CONFIGURATION — edit these for your data
 # ============================================================
-PROJECT_DIR="/projects/0/prjs0951/Sem"
+PROJECT_DIR="<your_project_dir>"   # e.g. /gpfs/work/myproject/cosmos
 SIF_IMAGE="${PROJECT_DIR}/cosmos-curate.sif"
 WORKSPACE="${PROJECT_DIR}/cosmos_curate_local_workspace"
 CONFIG_FILE="${PROJECT_DIR}/.config/cosmos_curate/config.yaml"
