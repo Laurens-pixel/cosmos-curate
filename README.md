@@ -23,6 +23,58 @@ This fork extends upstream cosmos-curate with four features and a full **Apptain
 
 **Setting up Gemma4?** The container needs a `pip_overrides` directory: [docs/gemma4-setup.md](docs/gemma4-setup.md)
 
+### Files added
+
+| File | Description |
+|---|---|
+| `cosmos_curate/models/cradio.py` | Model wrapper for C-RADIOv4-H: loads weights, preprocesses frames, returns L2-normalised embeddings. |
+| `cosmos_curate/pipelines/video/embedding/cradio_stages.py` | Two pipeline stages — `FrameCreationStage` (CPU) and `EmbeddingStage` (GPU ¼) — that run C-RADIO on each clip. |
+| `cosmos_curate/pipelines/video/captioning/gemma4_direct_stage.py` | Single captioning stage that runs Gemma4-E4B-it directly via HuggingFace, replacing the two-stage vLLM approach. |
+| `cosmos_curate/pipelines/video/captioning/gt_window_provider.py` | Abstract `GTWindowProvider` base class and `AgiBotGTWindowProvider` implementation that reads action boundaries from dataset JSON files. |
+| `cosmos_curate/models/judge_plugin.py` | Abstract `JudgePlugin` base class defining the interface all judge variants must implement. |
+| `cosmos_curate/models/judge_interface.py` | Registry dict and factory functions for looking up judge plugins by variant name. |
+| `cosmos_curate/models/judge_model_ids.py` | Mapping from variant name to HuggingFace model ID for all judge variants. |
+| `cosmos_curate/models/judge_gemma4.py` | Judge plugins `gemma4_e4b` and `gemma4_31b`: score captions using Gemma4 text-only inference. |
+| `cosmos_curate/models/judge_gemma4_video.py` | Judge plugins `gemma4_e4b_video` and `gemma4_31b_video`: score captions by decoding and watching the actual video clip. |
+| `cosmos_curate/models/judge_vci.py` | Judge plugins `vci_3b` and `vci_7b`: score captions using VCInspector (LoRA-tuned Qwen2.5-VL). |
+| `cosmos_curate/models/judge_video_utils.py` | Shared utilities for decoding MP4 bytes into PIL frames used by all video-based judge plugins. |
+| `cosmos_curate/pipelines/video/evaluation/judge_stage.py` | `JudgeStage`: judge-agnostic pipeline stage that looks up the requested plugin and calls `judge_batch()`. |
+| `cosmos_curate/pipelines/video/evaluation/phases.py` | `JudgePhase` and `JudgePhaseConfig` wiring the judge stage into the split pipeline. |
+| `cosmos_curate/pipelines/video/evaluation/gt_sources/` | Ground-truth source implementations (`agibot`, `inhard`, `manual`, `none`, `nuscenes`, `youcook2`) for optional judge grounding. |
+| `cosmos_curate/models/vllm_gemma4.py` | vLLM plugin for Gemma4 used by the captioning stage. |
+| `patches/monitoring_patched.py` | Patched `cosmos_xenna` monitoring module that fixes a `ConnectionError` when multiple Ray instances are active. |
+| `cosmos-curate.def` | Apptainer container definition file for building the `.sif` image on HPC clusters. |
+| `build_apptainer.sh` | Build script with quota monitoring to prevent accidental home-directory writes during the ~30 min build. |
+| `run_split_annotate.sbatch` | Slurm batch job template for running the full pipeline on a GPU node. |
+| `docs/hpc-apptainer.md` | Full deployment guide: Apptainer flags, bind mounts, Ray patch, memory requirements, STREAMING vs BATCH mode. |
+| `docs/new-features.md` | Usage guide for all four new pipeline features with copy-pasteable example commands. |
+| `docs/judge-system.md` | Judge plugin API reference, available variants, output format, and instructions for adding a new judge. |
+| `docs/gemma4-setup.md` | Step-by-step recipe for creating the `pip_overrides/transformers/` directory needed by Gemma4. |
+
+### Files modified
+
+| File | Change |
+|---|---|
+| `cosmos_curate/pipelines/video/splitting_pipeline.py` | Added `--embedding-algorithm cradio`, `--captioning-algorithm gemma4/openai/gemini`, `--evaluate`, `--judge-model`, `--gt-windows-source`, and `--multi-view` CLI flags. |
+| `cosmos_curate/pipelines/video/utils/data_model.py` | Added `cradio_frames`, `cradio_embedding`, `pipeline_start_ts`, and `stage_timestamps` fields to the `Clip` and `Video` data classes. |
+| `cosmos_curate/pipelines/video/read_write/metadata_writer_stage.py` | Added C-RADIO embedding output and per-stage timestamp persistence to the metadata writer. |
+| `cosmos_curate/pipelines/video/captioning/phases.py` | Wired in Gemma4, OpenAI, and Gemini captioning stages alongside the existing vLLM stage. |
+| `cosmos_curate/pipelines/video/captioning/vllm_caption_stage.py` | Added multi-view scene buffering (`--multi-view`) and GT-window support (`--gt-windows-source`). |
+| `cosmos_curate/pipelines/video/captioning/gemini_caption_stage.py` | Added exponential backoff and inline MP4 byte sending for the Gemini API. |
+| `cosmos_curate/pipelines/video/captioning/openai_caption_stage.py` | Switched from `video_url` (vLLM extension) to `image_url` frame blocks for compatibility with the official OpenAI API. |
+| `cosmos_curate/pipelines/video/clipping/clip_extraction_stages.py` | Carry `stage_timestamps` forward when creating per-chunk sub-tasks so timing data is not lost. |
+| `cosmos_curate/pipelines/video/embedding/phases.py` | Registered the C-RADIO embedding phase alongside the existing InternVideo2 phase. |
+| `cosmos_curate/models/prompts.py` | Added `av-multiview` prompt for multi-camera scene captioning. |
+| `cosmos_curate/models/vllm_qwen.py` | Added `make_multiview_message()` and `LIMIT_MM_PER_PROMPT = {"video": 3}` for multi-view inference. |
+| `cosmos_curate/models/vllm_plugin.py` | Added `make_multiview_llm_input()` abstract method to the vLLM plugin interface. |
+| `cosmos_curate/configs/all_models.json` | Added `cradio_v4_h` model entry. |
+| `cosmos_curate/core/utils/infra/performance_utils.py` | Minor instrumentation additions for per-stage timing. |
+
+---
+
+> **Everything below this line is from the original NVIDIA cosmos-curate repository:**
+> [https://github.com/NVIDIA/cosmos-curator](https://github.com/NVIDIA/cosmos-curator)
+
 ---
 
 
