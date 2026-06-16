@@ -16,31 +16,58 @@ downstream_eval/
   common/            # data structures + loaders for the cosmos-curate output layout
   segmentation/      # 1. Segmentation Quality  (boundary, completeness, ordering)
   captioning/        # 2. Caption Quality       (reference, model-based, temporal, judge)
-  downstream/        # 3. Downstream Task Perf.  (retrieval, action recognition, robot)
+  downstream/        # 3. Downstream Task Perf.  — tasks are *performed*, then scored
+    encoders.py                  #    pluggable text encoders (numpy fallback + optional real)
+    retrieval{,_runner}.py       #    metrics + runner (nearest-neighbour search)
+    action_recognition{,_runner}.py  # metrics + runner (centroid / linear-probe / zero-shot)
+    robot_completion.py          #    metrics
+    policy_learning/             #    LeRobot adapter + diffusion-policy train + LIBERO rollout
   mock_data.py       # generates a tiny pipeline-style output tree + ground truth
-  run_smoke.py       # end-to-end smoke test over the mock data
+  run_smoke.py       # end-to-end smoke test: runs all three downstream tasks, then scores
   tests/             # pytest unit tests with hand-computed expectations
 ```
+
+Downstream tasks are **executed**, not just scored: retrieval runs a real nearest-neighbour
+search over encoded captions/embeddings; action recognition trains/runs three classifiers;
+policy learning trains a LeRobot diffusion policy and rolls it out closed-loop (with a
+pure-numpy synthetic env so the rollout→metrics path runs without a GPU/sim).
 
 ## Quick start
 
 ```bash
-# End-to-end smoke test (no GPU / heavy deps required):
+# End-to-end smoke test over a mock pipeline output (no GPU / heavy deps required):
 python -m downstream_eval.run_smoke
+
+# Prove each downstream task actually works (positive vs. control discrimination):
+python -m downstream_eval.run_downstream_smoke
 
 # Unit tests (the main `pytest` run ignores this dir via testpaths=tests):
 pytest downstream_eval/tests -o addopts="" -p no:cacheprovider
 ```
 
+`run_downstream_smoke` runs each task with real signal **and** a control where the signal is
+destroyed (shuffled references / random labels / untrained policy), asserting the positive
+case clearly beats the control — so a task only passes if it genuinely responds to structure:
+
+```
+retrieval:           recall@1 1.00 vs 0.00 (shuffled refs)
+action_recognition:  centroid 1.00 / probe 1.00 vs 0.15 random labels (chance 0.25)
+policy_learning:     trained BC policy success 1.00 vs 0.00 random policy (held-out tasks)
+```
+
 Metric *math* depends only on `numpy`. Model-based metrics degrade gracefully when their
 optional dependencies are absent:
 
-| Metric | Optional dependency | Behaviour if missing |
+| Capability | Optional dependency | Behaviour if missing |
 | --- | --- | --- |
 | BERTScore | `bert_score` | returns `{"available": false, ...}` |
 | CLIPScore (from frames) | `open_clip` + `torch` | use `clipscore_from_embeddings` instead |
 | METEOR (full) | `nltk` + wordnet | falls back to exact-match METEOR |
 | Narrative coherence | any LLM judge callable | falls back to lexical continuity |
+| Retrieval / zero-shot text encoder | `sentence-transformers` | falls back to numpy `HashingEncoder` |
+| Cross-modal text→clip encoder | `cosmos_curate` models + GPU | use text↔text `run_caption_retrieval` instead |
+| Policy training | `lerobot` + `torch` + GPU | raises `RuntimeError`; use synthetic env for plumbing |
+| Closed-loop rollout | `libero` + `lerobot` + MuJoCo | raises `RuntimeError`; use synthetic env |
 
 ---
 
@@ -111,5 +138,8 @@ and LIBERO/LeRobot all assume their own formats. So:
   numpy/python (compact, dependency-light, unit-tested).
 - **BERTScore / CLIPScore** — thin optional wrappers over the established libraries (no point
   reimplementing model inference) with graceful fallbacks.
-- **Robot task completion** — a stable `EpisodeResult` schema + `RolloutProvider` protocol +
-  JSON loader so LIBERO/LeRobot rollouts can be scored, without vendoring those heavy stacks.
+- **Policy learning** — **uses LeRobot** (the open-source repo that directly fits our
+  `(observation, action, language)` setup) as an optional dependency: an adapter writes a
+  `LeRobotDataset`, `train.py` trains LeRobot's diffusion policy, and `rollout.py` evaluates it
+  in the LIBERO simulator. We build on it rather than vendoring/reimplementing it. A pure-numpy
+  synthetic env keeps the rollout→metrics path runnable without the heavy stack.

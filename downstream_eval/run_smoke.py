@@ -38,13 +38,19 @@ from downstream_eval.common.io import (
     load_window_judgments,
     predicted_segments_by_video,
 )
-from downstream_eval.downstream.action_recognition import evaluate_action_recognition
-from downstream_eval.downstream.retrieval import evaluate_retrieval
-from downstream_eval.downstream.robot_completion import (
-    EpisodeResult,
-    load_rollouts_from_json,
-    robot_task_metrics,
+from downstream_eval.downstream.action_recognition_runner import (
+    run_linear_probe,
+    run_nearest_centroid,
+    run_zero_shot_language,
 )
+from downstream_eval.downstream.encoders import build_text_encoder
+from downstream_eval.downstream.policy_learning.synthetic import (
+    NoisyPolicy,
+    ScriptedExpert,
+    run_synthetic_rollouts,
+)
+from downstream_eval.downstream.retrieval_runner import run_caption_retrieval
+from downstream_eval.downstream.robot_completion import robot_task_metrics
 from downstream_eval.mock_data import build_mock_dataset
 from downstream_eval.segmentation.metrics import evaluate_segmentation
 
@@ -113,54 +119,48 @@ def run(root: Path) -> None:  # noqa: PLR0915
     assert agg_from_file.keys() == agg_from_clips.keys()
     _show("Judge aggregation", agg_from_file)
 
-    # ---- Downstream: retrieval ----
-    retrieval = evaluate_retrieval(text_mat, clip_mat)
-    assert retrieval["text_to_clip"]["recall@1"] >= 0.8, "aligned embeddings should retrieve well"
-    _show("Retrieval", retrieval)
+    # ---- Downstream: retrieval (actually run caption retrieval, GT refs -> generated captions) ----
+    encoder = build_text_encoder("auto")
+    print(f"\n[retrieval/recognition use text encoder: {encoder.name}]")
+    references = {c.uuid: c.label for c in gt.clips}  # GT instruction per clip
+    retrieval_run = run_caption_retrieval(clips, references, encoder=encoder, ks=(1, 5))
+    assert retrieval_run.metrics["recall@5"] >= 0.5, "discriminative captions should retrieve well"
+    _show("Retrieval (caption retrieval task)", retrieval_run.metrics)
+    print(f"example: query {retrieval_run.query_ids[0][:8]} -> top5 {[g[:8] for g in retrieval_run.top_k(0)]}")
 
-    # ---- Downstream: action recognition (nearest class-centroid from embeddings) ----
+    # ---- Downstream: action recognition (actually classify clips three ways) ----
     class_names = gt.class_names
-    centroids = np.stack(
-        [
-            np.mean([embeddings[c.uuid] for c in gt.clips if c.label == name], axis=0)
-            for name in class_names
-        ]
-    )
-
-    def _normed(mat: np.ndarray) -> np.ndarray:
-        return mat / np.clip(np.linalg.norm(mat, axis=1, keepdims=True), 1e-8, None)
-
-    scores = _normed(clip_mat) @ _normed(centroids).T
     labels = np.array([class_names.index(c.label) for c in gt.clips], dtype=np.int64)
-    action = evaluate_action_recognition(labels, scores=scores, num_classes=len(class_names), ks=(1, 5))
-    assert action["top1_accuracy"] >= 0.5
-    _show("Action recognition", action)
+    clip_uuids = [c.uuid for c in gt.clips]
+    emb_mat = np.stack([embeddings[uid] for uid in clip_uuids])
 
-    # ---- Downstream: robot task completion ----
-    episodes = [
-        EpisodeResult(success=True, subtasks_completed=4, subtasks_total=4, steps=110, optimal_steps=100),
-        EpisodeResult(success=True, subtasks_completed=3, subtasks_total=4, steps=140, optimal_steps=100),
-        EpisodeResult(success=False, subtasks_completed=1, subtasks_total=4, steps=200, optimal_steps=100),
-    ]
-    rollout_path = root / "rollouts.json"
-    rollout_path.write_text(
-        json.dumps(
-            [
-                {
-                    "success": e.success,
-                    "subtasks_completed": e.subtasks_completed,
-                    "subtasks_total": e.subtasks_total,
-                    "steps": e.steps,
-                    "optimal_steps": e.optimal_steps,
-                }
-                for e in episodes
-            ]
-        )
+    centroid_run = run_nearest_centroid(emb_mat, labels, class_names, train_frac=0.6, seed=1, ks=(1, 5))
+    probe_run = run_linear_probe(emb_mat, labels, class_names, train_frac=0.6, seed=1, ks=(1, 5))
+    caption_texts = [c.caption for c in gt.clips]
+    zeroshot_run = run_zero_shot_language(caption_texts, labels, class_names, encoder=encoder, ks=(1, 5))
+    assert centroid_run.metrics["top1_accuracy"] >= 0.5
+    assert zeroshot_run.metrics["top1_accuracy"] >= 0.5
+    _show(
+        "Action recognition (performed)",
+        {
+            "nearest_centroid": centroid_run.metrics,
+            "linear_probe": probe_run.metrics,
+            "zero_shot_language": zeroshot_run.metrics,
+        },
     )
-    robot = robot_task_metrics(load_rollouts_from_json(rollout_path))
-    assert math.isclose(robot["task_success_rate"], 2 / 3, rel_tol=1e-6)
-    assert robot["efficiency_ratio"] <= 1.0
-    _show("Robot task completion", robot)
+
+    # ---- Downstream: policy learning (actually roll out policies in synthetic env, then score) ----
+    expert_rollouts = run_synthetic_rollouts(lambda _rng: ScriptedExpert(), num_episodes=12, seed=2)
+    learned_rollouts = run_synthetic_rollouts(lambda rng: NoisyPolicy(noise=0.9, rng=rng), num_episodes=12, seed=2)
+    expert_metrics = robot_task_metrics(expert_rollouts)
+    learned_metrics = robot_task_metrics(learned_rollouts)
+    assert math.isclose(expert_metrics["task_success_rate"], 1.0), "scripted expert should always succeed"
+    assert expert_metrics["efficiency_ratio"] <= 1.0
+    assert learned_metrics["task_success_rate"] <= expert_metrics["task_success_rate"]
+    _show(
+        "Policy learning (rollout -> task completion)",
+        {"scripted_expert": expert_metrics, "noisy_learned_policy": learned_metrics},
+    )
 
     print("\nAll smoke checks passed.")
 

@@ -67,3 +67,11 @@ class ClipRecord:
         for window in self.windows:
             out.extend(text for text in window.captions.values() if text)
         return out
+
+    def primary_caption_or_empty(self) -> str:
+        """Return the first non-empty caption across windows, or empty string."""
+        for window in self.windows:
+            caption = window.primary_caption()
+            if caption:
+                return caption
+        return ""
