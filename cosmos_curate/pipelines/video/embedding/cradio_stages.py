@@ -23,6 +23,7 @@ from loguru import logger
 
 from cosmos_curate.core.interfaces.model_interface import ModelInterface
 from cosmos_curate.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
+from cosmos_curate.core.utils.data.ref_resolver import prefetch, resolve_as_ready
 from cosmos_curate.core.utils.infra.gpu_start_helper import (
     gpu_stage_cleanup,
     gpu_stage_startup,
@@ -98,12 +99,13 @@ class CRadioFrameCreationStage(CuratorStage):
             self._timer.reinit(self, task.get_major_size())
             video = task.video
             video.stage_timestamps["CRadioFrameCreationStage_start"] = time.time()
-            for clip in video.clips:
-                if clip.encoded_data is None:
+            prefetch([clip.encoded_data for clip in video.clips])
+            for clip, data in resolve_as_ready([(clip, clip.encoded_data) for clip in video.clips]):
+                if data is None:
                     clip.errors["encoded_data"] = "empty"
                     continue
                 ef = clip.extracted_frames.resolve()
-                if self._frame_extraction_signature not in ef:
+                if ef is None or self._frame_extraction_signature not in ef:
                     clip.errors[f"frames-{self._frame_extraction_signature}"] = "missing"
                     logger.error(f"Clip {clip.uuid} has buffer but no extracted frames")
                     continue
@@ -123,14 +125,14 @@ class CRadioFrameCreationStage(CuratorStage):
                                 f"Re-extracting with higher target_fps={regen_fps}. "
                                 f"Current # frames={frames.shape[0]}.",
                             )
-                        with io.BytesIO(clip.encoded_data.resolve()) as fp:
+                        with io.BytesIO(data) as fp:
                             frames = extract_frames(
                                 fp,
                                 extraction_policy=FrameExtractionPolicy.sequence,
                                 sample_rate_fps=regen_fps,
                             )
                     # Create input frames for C-RADIOv4-H model, 432x432 and stack into a single tensor
-                    clip.cradio_frames = self._model.formulate_input_frames(list(frames))
+                    clip.cradio_frames = self._model.formulate_input_frames(list(frames))  # type: ignore[assignment]
                 # Done with extracted_frames
                 clip.extracted_frames.drop()
 
@@ -212,19 +214,20 @@ class CRadioEmbeddingStage(CuratorStage):
             video.stage_timestamps["CRadioEmbeddingStage_start"] = time.time()
             with self._timer.time_process(len(video.clips)):
                 for clip in video.clips:
-                    if clip.cradio_frames is None:
+                    cradio_frames = clip.cradio_frames.resolve()
+                    if cradio_frames is None:
                         clip.errors["cradio_frames"] = "empty"
                         continue
-                    #Run the C-RADIOv4-H model on the input frames and mean pools all 8 
+                    # Run the C-RADIOv4-H model on the input frames and mean pools all 8
                     # frame embeddings into one embedding vector
-                    embedding = self._model.encode_video_frames(clip.cradio_frames) 
+                    embedding = self._model.encode_video_frames(cradio_frames)
                     if embedding.numel() == 0:
                         logger.error(f"Unable to compute C-RADIOv4-H embedding for clip={clip.uuid}")
                         clip.errors["cradio_embedding"] = "failed"
                     else:
                         clip.cradio_embedding = embedding.numpy()
                     # Done with cradio_frames
-                    clip.cradio_frames = None
+                    clip.cradio_frames.drop()
 
             video.stage_timestamps["CRadioEmbeddingStage_end"] = time.time()
 

@@ -49,3 +49,6 @@ nuscenes_to_video.py
 download_*.py
 download_*.sh
 
+# Claude Code local metadata and results
+.claude/
+results/

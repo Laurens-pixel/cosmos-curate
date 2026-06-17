@@ -185,7 +185,8 @@ class Clip:
     intern_video_2_frames: LazyData[npt.NDArray[np.float32]] = attrs.field(factory=LazyData, converter=LazyData.coerce)  # type: ignore[misc]
     intern_video_2_embedding: npt.NDArray[np.float32] | None = None
     openai_embedding: npt.NDArray[np.float32] | None = None
-    cradio_frames: npt.NDArray[np.float32] | None = None
+    # C-RADIOv4-H input frames; LazyData for zero-copy transport, matching the embedding frame fields above.
+    cradio_frames: LazyData[npt.NDArray[np.float32]] = attrs.field(factory=LazyData, converter=LazyData.coerce)  # type: ignore[misc]
     cradio_embedding: npt.NDArray[np.float32] | None = None
     # captioning
     windows: list[Window] = attrs.Factory(list)
@@ -268,8 +269,7 @@ class Clip:
             total_size += self.cosmos_embed1_embedding.nbytes
         if self.openai_embedding is not None:
             total_size += self.openai_embedding.nbytes
-        if self.cradio_frames is not None:
-            total_size += self.cradio_frames.nbytes
+        total_size += self.cradio_frames.nbytes
         if self.cradio_embedding is not None:
             total_size += self.cradio_embedding.nbytes
         for window in self.windows:

@@ -66,6 +66,41 @@ def _get_rss_mb() -> float:
     return _CURRENT_PROCESS.memory_info().rss / (1024 * 1024)
 
 
+def _get_gpu_mem_mb() -> tuple[float, float]:
+    """Get this process's GPU memory usage in megabytes.
+
+    Returns (current_allocated, peak_allocated) since the last peak reset.
+    Returns (0.0, 0.0) when torch or CUDA is unavailable (e.g. CPU stages),
+    so callers never need to guard the import themselves.
+
+    Returns:
+        Tuple of (current allocated MB, peak allocated MB).
+
+    """
+    try:
+        import torch  # noqa: PLC0415
+    except ImportError:
+        return 0.0, 0.0
+    if not torch.cuda.is_available():
+        return 0.0, 0.0
+    mb = 1024 * 1024
+    return torch.cuda.memory_allocated() / mb, torch.cuda.max_memory_allocated() / mb
+
+
+def _reset_gpu_peak() -> None:
+    """Reset the CUDA peak-memory counter so peak is measured per batch.
+
+    No-op when torch or CUDA is unavailable. Only resets the bookkeeping
+    counter; it does not free any memory.
+    """
+    try:
+        import torch  # noqa: PLC0415
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
 @attrs.define
 class StagePerfStats:
     """Statistics for tracking stage performance metrics.
@@ -77,6 +112,10 @@ class StagePerfStats:
         rss_before_mb: Process RSS (MB) before process_data() call.
         rss_after_mb: Process RSS (MB) after process_data() call.
         rss_delta_mb: Change in RSS (MB) during process_data() (can be negative).
+        gpu_mem_before_mb: CUDA memory allocated (MB) before process_data() call (0 on CPU stages).
+        gpu_mem_after_mb: CUDA memory allocated (MB) after process_data() call.
+        gpu_mem_delta_mb: Change in CUDA memory allocated (MB) during process_data() (can be negative).
+        gpu_mem_peak_mb: Peak CUDA memory allocated (MB) during process_data(); the metric that drives OOM.
         wall_start: Absolute wall-clock time (time.time()) when process_data() began.
             Used for Gantt charts and performance analysis across stages.
         wall_end: Absolute wall-clock time (time.time()) when process_data() ended.
@@ -89,6 +128,10 @@ class StagePerfStats:
     rss_before_mb: float = 0.0
     rss_after_mb: float = 0.0
     rss_delta_mb: float = 0.0
+    gpu_mem_before_mb: float = 0.0
+    gpu_mem_after_mb: float = 0.0
+    gpu_mem_delta_mb: float = 0.0
+    gpu_mem_peak_mb: float = 0.0
     wall_start: float = 0.0
     wall_end: float = 0.0
 
@@ -106,6 +149,10 @@ class StagePerfStats:
             rss_before_mb=max(self.rss_before_mb, other.rss_before_mb),
             rss_after_mb=max(self.rss_after_mb, other.rss_after_mb),
             rss_delta_mb=max(self.rss_delta_mb, other.rss_delta_mb),
+            gpu_mem_before_mb=max(self.gpu_mem_before_mb, other.gpu_mem_before_mb),
+            gpu_mem_after_mb=max(self.gpu_mem_after_mb, other.gpu_mem_after_mb),
+            gpu_mem_delta_mb=max(self.gpu_mem_delta_mb, other.gpu_mem_delta_mb),
+            gpu_mem_peak_mb=max(self.gpu_mem_peak_mb, other.gpu_mem_peak_mb),
             # Earliest start and latest end across aggregated tasks.
             # When one side has wall_start=0 (no data), use the other side's value.
             wall_start=(
@@ -131,6 +178,10 @@ class StagePerfStats:
         self.rss_before_mb = 0.0
         self.rss_after_mb = 0.0
         self.rss_delta_mb = 0.0
+        self.gpu_mem_before_mb = 0.0
+        self.gpu_mem_after_mb = 0.0
+        self.gpu_mem_delta_mb = 0.0
+        self.gpu_mem_peak_mb = 0.0
         self.wall_start = 0.0
         self.wall_end = 0.0
 
@@ -214,6 +265,7 @@ class StageTimer:
         self._idle_time_s = 0.0
         self._startup_time_s = 0.0
         self._rss_before_mb = 0.0
+        self._gpu_mem_before_mb = 0.0
 
     def reinit(self, stage: CuratorStage, stage_input_size: int = 1) -> None:
         """Reinitialize the stage timer.
@@ -235,6 +287,11 @@ class StageTimer:
         self._input_data_size_b = stage_input_size
         # Snapshot RSS before process_data() work begins.
         self._rss_before_mb = _get_rss_mb()
+        # Snapshot GPU memory and reset the peak counter for GPU stages only,
+        # so CPU stages pay no CUDA-query cost.
+        if self._num_gpus > 0:
+            self._gpu_mem_before_mb, _ = _get_gpu_mem_mb()
+            _reset_gpu_peak()
         self._start = time.time()
         if self._initialized:
             self._idle_time_s = self._start - self._last_active_time
@@ -249,6 +306,7 @@ class StageTimer:
                 "stage.name": self._stage_name,
                 "stage.input_data_size_b": stage_input_size,
                 "stage.rss_before_mb": round(self._rss_before_mb, 1),
+                "stage.gpu_mem_before_mb": round(self._gpu_mem_before_mb, 1),
                 "stage.idle_time_s": round(self._idle_time_s, 3),
             },
         )
@@ -312,12 +370,18 @@ class StageTimer:
         rss_after_mb = _get_rss_mb()
         rss_delta_mb = rss_after_mb - rss_before_mb
 
+        # Snapshot GPU memory after work completes (GPU stages only).
+        gpu_mem_before_mb = self._gpu_mem_before_mb
+        gpu_mem_after_mb, gpu_mem_peak_mb = _get_gpu_mem_mb() if num_gpus > 0 else (0.0, 0.0)
+        gpu_mem_delta_mb = gpu_mem_after_mb - gpu_mem_before_mb
+
         if verbose:
             logger.info(
                 f"Stats: {process_data_dur_s=:.3f} - {num_samples=} - {avg_dur_s=:.3f} - "
                 f"{num_gpus=} - {num_cpus=} - {start_time_s=:.3f} - {idle_time_s=:.3f} - "
                 f"{source_video_len_s=:.1f} - {input_data_size_mb=:.3f} - "
-                f"{rss_before_mb=:.1f} - {rss_after_mb=:.1f} - {rss_delta_mb=:+.1f}",
+                f"{rss_before_mb=:.1f} - {rss_after_mb=:.1f} - {rss_delta_mb=:+.1f} - "
+                f"{gpu_mem_after_mb=:.1f} - {gpu_mem_delta_mb=:+.1f} - {gpu_mem_peak_mb=:.1f}",
             )
 
         # OTel: annotate the current span (e.g. process_data lifecycle
@@ -334,6 +398,10 @@ class StageTimer:
                 "stage.rss_before_mb": round(rss_before_mb, 1),
                 "stage.rss_after_mb": round(rss_after_mb, 1),
                 "stage.rss_delta_mb": round(rss_delta_mb, 1),
+                "stage.gpu_mem_before_mb": round(gpu_mem_before_mb, 1),
+                "stage.gpu_mem_after_mb": round(gpu_mem_after_mb, 1),
+                "stage.gpu_mem_delta_mb": round(gpu_mem_delta_mb, 1),
+                "stage.gpu_mem_peak_mb": round(gpu_mem_peak_mb, 1),
                 "stage.num_gpus": num_gpus,
                 "stage.num_cpus": num_cpus,
             }
@@ -348,6 +416,10 @@ class StageTimer:
             rss_before_mb=rss_before_mb,
             rss_after_mb=rss_after_mb,
             rss_delta_mb=rss_delta_mb,
+            gpu_mem_before_mb=gpu_mem_before_mb,
+            gpu_mem_after_mb=gpu_mem_after_mb,
+            gpu_mem_delta_mb=gpu_mem_delta_mb,
+            gpu_mem_peak_mb=gpu_mem_peak_mb,
             # Absolute wall-clock timestamps for distributed trace / Gantt chart.
             wall_start=self._start,
             wall_end=end,

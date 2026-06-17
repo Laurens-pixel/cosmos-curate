@@ -107,6 +107,20 @@ class TestStagePerfStatsAdd:
         assert result.rss_after_mb == pytest.approx(200.0)
         assert result.rss_delta_mb == pytest.approx(80.0)
 
+    def test_gpu_mem_fields_use_max(self) -> None:
+        """Verify gpu_mem_* fields use max aggregation, like RSS."""
+        s1 = StagePerfStats(
+            gpu_mem_before_mb=1000.0, gpu_mem_after_mb=1500.0, gpu_mem_delta_mb=500.0, gpu_mem_peak_mb=1600.0
+        )
+        s2 = StagePerfStats(
+            gpu_mem_before_mb=1200.0, gpu_mem_after_mb=1400.0, gpu_mem_delta_mb=200.0, gpu_mem_peak_mb=1800.0
+        )
+        result = s1 + s2
+        assert result.gpu_mem_before_mb == pytest.approx(1200.0)
+        assert result.gpu_mem_after_mb == pytest.approx(1500.0)
+        assert result.gpu_mem_delta_mb == pytest.approx(500.0)
+        assert result.gpu_mem_peak_mb == pytest.approx(1800.0)
+
     def test_wall_timestamps_min_start_max_end(self) -> None:
         """Verify wall_start uses min and wall_end uses max across operands."""
         now = time.time()
@@ -195,7 +209,7 @@ class TestStagePerfStatsToDict:
     """Verify to_dict() returns all fields as a JSON-serializable dict."""
 
     def test_contains_all_field_names(self) -> None:
-        """Verify to_dict() returns all 8 expected field names."""
+        """Verify to_dict() returns every expected field name."""
         d = StagePerfStats().to_dict()
         expected_keys = {
             "process_time",
@@ -204,6 +218,10 @@ class TestStagePerfStatsToDict:
             "rss_before_mb",
             "rss_after_mb",
             "rss_delta_mb",
+            "gpu_mem_before_mb",
+            "gpu_mem_after_mb",
+            "gpu_mem_delta_mb",
+            "gpu_mem_peak_mb",
             "wall_start",
             "wall_end",
         }

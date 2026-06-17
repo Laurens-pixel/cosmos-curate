@@ -52,7 +52,7 @@ class OpenAIEmbeddingConfig:
 class EmbeddingConfig:
     """Configuration for clip embedding generation."""
 
-    algorithm: str = "internvideo2"
+    algorithm: str = "cosmos-embed1-336p"
     target_fps: float = 2.0
     gpus_per_worker: float = 0.25
     batch_size: int = 8
