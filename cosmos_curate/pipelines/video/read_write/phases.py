@@ -47,7 +47,7 @@ class OutputConfig:
     upload_cds_parquet: bool = False
     dry_run: bool = False
     generate_embeddings: bool = True
-    embedding_algorithm: str = "cosmos-embed1-336p"
+    embedding_algorithm: str = "cosmos-embed1-448p"
     embedding_model_version: str = "unspecified"
     generate_previews: bool = False
     caption_models: list[str] = attrs.Factory(list)

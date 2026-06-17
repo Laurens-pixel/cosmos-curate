@@ -916,11 +916,11 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     parser.add_argument(
         "--embedding-algorithm",
         type=str,
-        default="cosmos-embed1-336p",
+        default="cosmos-embed1-448p",
         choices=["cosmos-embed1-224p", "cosmos-embed1-336p", "cosmos-embed1-448p", "cradio", "internvideo2", "openai"],
         help=(
-            "Embedding algorithm to use. Default cosmos-embed1-336p is video-native (temporal) and the "
-            "recommended choice; internvideo2 is the older alternative, cradio is image-only (per-frame mean-pooled)."
+            "Embedding algorithm to use. Default cosmos-embed1-448p is video-native (temporal) with high resolution "
+            "for fine-grained manipulation detail; internvideo2 is the older alternative, cradio is image-only."
         ),
     )
     parser.add_argument(
