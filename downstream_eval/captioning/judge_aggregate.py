@@ -68,15 +68,20 @@ def aggregate_judgments(records: Iterable[dict[str, Any]]) -> dict[str, dict[str
         verdicts = [r.get("verdict") for r in recs if r.get("verdict") is not None]
         scores = [float(r["score"]) for r in recs if isinstance(r.get("score"), (int, float))]
         distribution = dict(Counter(verdicts))
+        num_correct = sum(1 for v in verdicts if isinstance(v, str) and v.upper() == _CORRECT)
         summary: dict[str, Any] = {
             "num": len(recs),
             "num_judged": len(verdicts),
-            "correct_rate": (sum(1 for v in verdicts if v == _CORRECT) / len(verdicts)) if verdicts else float("nan"),
+            "correct_rate": (num_correct / len(verdicts)) if verdicts else float("nan"),
             "mean_score": (sum(scores) / len(scores)) if scores else float("nan"),
             "verdict_distribution": distribution,
         }
 
-        pairs = [(_human_label(r), r.get("verdict") == _CORRECT) for r in recs if _human_label(r) is not None]
+        def _is_correct(record: dict[str, Any]) -> bool:
+            verdict = record.get("verdict")
+            return isinstance(verdict, str) and verdict.upper() == _CORRECT
+
+        pairs = [(_human_label(r), _is_correct(r)) for r in recs if _human_label(r) is not None]
         if pairs:
             tp = sum(1 for human, pred in pairs if human and pred)
             fp = sum(1 for human, pred in pairs if not human and pred)
