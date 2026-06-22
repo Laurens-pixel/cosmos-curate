@@ -24,6 +24,8 @@ _JUDGE_MODELS: dict[str, str | None] = {
     "gemma4_31b_video": "google/gemma-4-31B-it",
     "vci_3b": "dipta007/VCInspector-3B",
     "vci_7b": "dipta007/VCInspector-7B",
+    "qwen3vl_30b": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    "qwen3vl_30b_fp8": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
 }
 
 

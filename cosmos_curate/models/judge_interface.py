@@ -31,6 +31,7 @@ from typing import cast
 from cosmos_curate.models.judge_gemma4 import JudgeGemma4_31B, JudgeGemma4E4B
 from cosmos_curate.models.judge_gemma4_video import JudgeGemma4_31BVideo, JudgeGemma4E4BVideo
 from cosmos_curate.models.judge_plugin import JudgePlugin
+from cosmos_curate.models.judge_qwen3vl import JudgeQwen3VL30B, JudgeQwen3VL30BFP8
 from cosmos_curate.models.judge_vci import JudgeVCI3B, JudgeVCI7B
 
 # Add new judge plugins here.
@@ -41,6 +42,8 @@ _JUDGE_PLUGINS: dict[str, type[JudgePlugin]] = {
     JudgeGemma4_31BVideo.variant(): JudgeGemma4_31BVideo,
     JudgeVCI3B.variant(): JudgeVCI3B,
     JudgeVCI7B.variant(): JudgeVCI7B,
+    JudgeQwen3VL30B.variant(): JudgeQwen3VL30B,
+    JudgeQwen3VL30BFP8.variant(): JudgeQwen3VL30BFP8,
 }
 
 
@@ -56,10 +59,7 @@ def get_judge_plugin_class(variant: str) -> type[JudgePlugin]:
     constructing the plugin yet.
     """
     if variant not in _JUDGE_PLUGINS:
-        msg = (
-            f"Unknown judge variant: {variant!r}. "
-            f"Registered variants: {list_judge_variants()}"
-        )
+        msg = f"Unknown judge variant: {variant!r}. Registered variants: {list_judge_variants()}"
         raise ValueError(msg)
     return cast("type[JudgePlugin]", _JUDGE_PLUGINS[variant])
 

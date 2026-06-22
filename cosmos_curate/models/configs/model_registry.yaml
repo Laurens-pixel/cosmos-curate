@@ -1,0 +1,103 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Central, config-driven registry of caption + judge model parameters.
+#
+# Why this file exists
+# --------------------
+# Historically, model parameters (HF id, GPU/CPU request, frame sampling, prompt
+# variant, batch size) were hard-coded as constants inside each plugin
+# (e.g. ``_SAMPLING_FPS`` / ``_MAX_FRAMES`` in judge_vci.py). That meant tuning a
+# judge required editing Python. This registry externalises those knobs so a new
+# judge/captioner — or a re-tune of an existing one — is a YAML edit, not a code change.
+#
+# How it is consumed
+# ------------------
+# ``cosmos_curate.models.model_registry`` loads this file (lazily, cached). Plugins
+# that opt in call ``model_registry.get_judge_params(variant)`` /
+# ``get_caption_params(variant)`` in ``setup()`` to read their knobs. Plugins that do
+# not opt in keep working exactly as before — this layer is purely additive.
+#
+# Override
+# --------
+# Point the ``COSMOS_MODEL_REGISTRY`` env var at a YAML file with the same shape to
+# override/extend any entry without touching the repo copy. User entries are merged
+# on top of these defaults (per-variant, shallow merge).
+
+# ── Judge models ──────────────────────────────────────────────────────────────
+# evidence_kind: text | frames | mp4_bytes
+# resources.gpus may be fractional (e.g. 0.5) to pack multiple workers per GPU.
+judges:
+  qwen3vl_30b:
+    model_id: Qwen/Qwen3-VL-30B-A3B-Instruct
+    evidence_kind: mp4_bytes
+    conda_env: unified
+    resources: {cpus: 8.0, gpus: 1.0}
+    sampling_fps: 2.0
+    max_frames: 16
+    frame_size: 448
+    max_new_tokens: 192          # structured verdict + object/action lines + explanation
+    prompt_variant: structured_grounding
+    notes: >-
+      Qwen3-VL-30B-A3B is an MoE (3B active params/token). No fine-tune needed; far
+      stronger instruction following than the VCInspector LoRA. Recommended replacement
+      for vci_7b as the default VLM judge once weights are downloaded.
+
+  qwen3vl_30b_fp8:
+    model_id: Qwen/Qwen3-VL-30B-A3B-Instruct-FP8
+    evidence_kind: mp4_bytes
+    conda_env: unified
+    resources: {cpus: 8.0, gpus: 1.0}
+    sampling_fps: 2.0
+    max_frames: 16
+    frame_size: 448
+    max_new_tokens: 192
+    prompt_variant: structured_grounding
+    notes: FP8 quantised — ~half the VRAM of the bf16 variant, fits comfortably on one A100/H100.
+
+  # Existing judges documented here for completeness / discoverability. Their plugins
+  # do not (yet) read these values — they still use their in-file constants — but listing
+  # them keeps the registry the single source of truth for benchmark bookkeeping.
+  vci_7b:
+    model_id: dipta007/VCInspector-7B
+    evidence_kind: mp4_bytes
+    conda_env: unified
+    resources: {cpus: 8.0, gpus: 0.5}
+    sampling_fps: 1.0
+    max_frames: 32
+    frame_size: 224
+    max_new_tokens: 32
+    prompt_variant: lenient_binary
+  gemma4_e4b_video:
+    model_id: google/gemma-4-E4B-it
+    evidence_kind: mp4_bytes
+    conda_env: unified
+    resources: {cpus: 4.0, gpus: 1.0}
+    sampling_fps: 4.0
+    max_frames: 32
+    frame_size: 448
+    max_new_tokens: 64
+    prompt_variant: lenient_binary
+
+# ── Caption models ──────────────────────────────────────────────────────────────
+captions:
+  qwen:
+    model_id: Qwen/Qwen2.5-VL-7B-Instruct
+    backend: vllm
+    notes: Current pipeline default. Superseded by qwen3_vl_30b but kept as the stable baseline.
+  qwen3_vl_30b:
+    model_id: Qwen/Qwen3-VL-30B-A3B-Instruct
+    backend: vllm
+    notes: >-
+      Already wired in vllm_qwen.py / vllm_model_ids.py. Recommended captioner upgrade —
+      MoE, fits 1-2 GPUs, stronger than Qwen2.5-VL-7B on video understanding benchmarks.
+  qwen3_vl_30b_fp8:
+    model_id: Qwen/Qwen3-VL-30B-A3B-Instruct-FP8
+    backend: vllm
+  ovis2_34b:
+    model_id: AIDC-AI/Ovis2-34B
+    backend: vllm
+    notes: >-
+      Different architecture (AIMv2 vision encoder + Qwen2.5-32B text), high on the Open
+      VLM Leaderboard. NOT yet wired as a plugin — listed here as a benchmark candidate.
+      Needs a vllm_ovis.py plugin + ~70GB weight download before it can run.

@@ -29,6 +29,26 @@ from cosmos_curate.pipelines.video.utils.data_model import (
 )
 
 
+def _format_multi_action_gt(gt_text: str, gt_extras: dict[str, Any]) -> str:
+    """Format GT for a text judge, listing *all* actions overlapping the window.
+
+    When the GT source exposes ``all_actions`` (every overlapping action with coverage),
+    render them as a short numbered list so the judge knows the clip may contain more than
+    one action. Falls back to the single ``gt_text`` for sources/older data without it.
+    """
+    actions = gt_extras.get("all_actions")
+    if not isinstance(actions, list) or len(actions) <= 1:
+        return gt_text
+    parts = []
+    for a in actions:
+        text = str(a.get("action_text", "")).strip()
+        if text:
+            parts.append(text)
+    if len(parts) <= 1:
+        return gt_text
+    return " ".join(f"({i}) {p}" for i, p in enumerate(parts, 1))
+
+
 @attrs.define(frozen=True)
 class JudgeStageConfig:
     """Configuration the JudgeStage needs at construction time.
@@ -121,7 +141,8 @@ class JudgeStage(CuratorStage):
     # ── Per-task processing ───────────────────────────────────────────────────
 
     def _build_items_for_video(
-        self, video: Any  # noqa: ANN401 — Video defined in data_model
+        self,
+        video: Any,  # noqa: ANN401 — Video defined in data_model
     ) -> tuple[list[JudgeItem], list[tuple[Window, str]]]:
         """Walk the video's windows and produce parallel lists of items + back-pointers.
 
@@ -152,8 +173,11 @@ class JudgeStage(CuratorStage):
                 )
 
                 # Video-evidence judges (mp4_bytes) can watch the clip directly —
-                # withhold GT text so they form an independent opinion.
-                item_gt = gt_text if evidence_kind == "text" else None
+                # withhold GT text so they form an independent opinion. Text judges receive
+                # *all* actions overlapping the window (not just the majority one) so a
+                # caption that correctly describes a minor / transition action is not
+                # penalised against a single majority label.
+                item_gt = _format_multi_action_gt(gt_text, gt_extras) if evidence_kind == "text" else None
 
                 item = JudgeItem(
                     caption=caption,
@@ -228,12 +252,8 @@ class JudgeStage(CuratorStage):
                     try:
                         results = self._plugin.judge_batch(chunk)
                     except Exception as exc:  # noqa: BLE001
-                        logger.exception(
-                            f"JudgeStage[{self._config.judge_variant}] batch failed at {i}: {exc}"
-                        )
-                        results = [
-                            JudgeResult(verdict=None, score=1, explanation=str(exc)) for _ in chunk
-                        ]
+                        logger.exception(f"JudgeStage[{self._config.judge_variant}] batch failed at {i}: {exc}")
+                        results = [JudgeResult(verdict=None, score=1, explanation=str(exc)) for _ in chunk]
 
                     if len(results) != len(chunk):
                         msg = (

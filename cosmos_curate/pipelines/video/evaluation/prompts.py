@@ -8,11 +8,11 @@ All prompts use ``{gt_action_text}`` and ``{caption_text}`` placeholders. Plugin
 
 # Lenient binary judge — best-performing on AgiBotWorld (Gemma4 F1=0.859 on 30-vid manual).
 LENIENT_BINARY = """\
-You are checking whether a robot manipulation caption and a ground-truth action phrase
-describe the same overall goal. Be lenient: wording and specificity can differ, but the
-core intent must match.
+You are checking whether a robot manipulation caption matches the ground-truth action(s)
+for the clip. Be lenient: wording and specificity can differ, but the core intent must match.
 
-Ground truth (what actually happened):
+Ground truth (what actually happened). The clip may contain MORE THAN ONE action — when
+several are listed (e.g. "(1) ... (2) ..."), they all genuinely occur in this clip:
 "{gt_action_text}"
 
 Caption (what the model said):
@@ -22,15 +22,18 @@ Judge as CORRECT if:
 - The caption mentions the same object as the GT, even if phrased differently
   ("purple vegetable" for "onion", "mushroom" for "shiitake mushroom", "bottle" for
   "green tea bottle", "item" or "object" when context is clear — all fine)
-- The caption conveys the same goal as the GT, even if it also describes extra steps
-  (e.g. GT = "Retrieve onion" and caption says "picks up onion and places it in cart"
-  — the retrieval goal is captured, so this is CORRECT)
-- Minor differences in phrasing, perspective, or level of detail are acceptable
+- The caption faithfully describes the action(s) present. If several GT actions are listed,
+  a caption that describes ANY of them is acceptable, and one that describes the transition
+  across them (e.g. "grasps the bottle and sets it in the basket") is the best case — do
+  NOT penalise a caption for naming a minor / boundary action that genuinely occurred
+- The caption conveys the same goal even if it also describes extra steps, and minor
+  differences in phrasing, perspective, or level of detail are acceptable
 
 Judge as INCORRECT only if:
 - The caption clearly names a different object (e.g. "cucumber" when GT is "mushroom")
-- The caption describes the opposite action to the GT with no mention of the GT action
-  (e.g. GT = "Retrieve X" but caption only says "places X down" without any picking)
+- The caption asserts an action that is NOT among the listed GT actions, or describes the
+  opposite of the action(s) that occurred (e.g. only "places X down" when every GT action
+  is a retrieval)
 
 Respond with exactly one word on the first line — CORRECT or INCORRECT — then one
 sentence explaining why."""
