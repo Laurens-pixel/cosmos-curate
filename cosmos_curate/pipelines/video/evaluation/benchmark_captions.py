@@ -1201,20 +1201,27 @@ def build_report(
     manual_gt: dict[str, bool] | None,
     coverage_threshold: float,
     fine_recs: list[WindowRec] | None = None,
-    encode: Any | None = None,  # noqa: ANN401 — optional sentence-transformers encode callable
+    encoders: dict[str, Any] | None = None,  # {model_name: encode_callable}
 ) -> dict[str, Any]:
     """Assemble the full benchmark report + ranking."""
+    encoders = encoders or {}
+    # primary text encoder drives the table/composite/order columns; all encoders are
+    # reported under grounding["semantic_models"] so several can be compared side by side.
+    primary_encode = next(iter(encoders.values())) if encoders else None
     per_run: dict[str, Any] = {}
     for name, recs in runs.items():
         grounding = grounding_stats(recs, coverage_threshold)
         grounding.update(granularity_stats(recs))
         grounding.update(idle_stats(recs, coverage_threshold))
-        grounding.update(order_stats(recs, encode))
+        grounding.update(order_stats(recs, primary_encode))
         grounding.update(robustness_stats(recs))
         if fine_recs:
             grounding.update(subaction_completeness(recs, fine_recs))
-        if encode is not None:
-            grounding.update(semantic_stats(recs, encode))
+        if encoders:
+            sem_by_model = {mname: semantic_stats(recs, enc) for mname, enc in encoders.items()}
+            primary_name = next(iter(sem_by_model))
+            grounding.update(sem_by_model[primary_name])  # flat sem_* from primary → table/composite
+            grounding["semantic_models"] = sem_by_model  # full per-model for comparison
         per_run[name] = {
             "captions": caption_stats(recs),
             "judges": judge_stats(recs, manual_gt),
@@ -1286,6 +1293,17 @@ def print_summary(report: dict[str, Any]) -> None:
             print(f"\nJudge agreement [{n}]:")
             for pair, d in agr.items():
                 print(f"  {pair}: agree={_fmt(d['raw_agreement'])} kappa={_fmt(d['cohens_kappa'])} (n={d['n']})")
+    # per-encoder semantic comparison (when several --semantic-model are given)
+    for n in report["runs"]:
+        sm = report["runs"][n]["grounding"].get("semantic_models")
+        if sm and len(sm) > 1:
+            print(f"\nSemantic text↔text encoders [{n}] (compare which fits best):")
+            for mname, d in sm.items():
+                print(
+                    f"  {mname:>16}: sem_f1={_fmt(d.get('sem_f1'))} "
+                    f"recall={_fmt(d.get('sem_recall'))} precision={_fmt(d.get('sem_precision'))} "
+                    f"len_bias(f1)={_fmt((d.get('length_robustness') or {}).get('sem_f1_vs_length_r'))}"
+                )
     # length-bias diagnostic: how much each grounding score correlates with caption length.
     # |r| near 0 = length-robust; high positive = a longer caption inflates the score.
     for n in report["runs"]:
@@ -1368,11 +1386,12 @@ def main() -> None:
     )
     ap.add_argument(
         "--semantic-model",
-        type=Path,
+        action="append",
         default=None,
-        metavar="DIR",
-        help="Optional sentence-transformers model dir (e.g. .../models/sentence-transformers/all-MiniLM-L6-v2). "
-        "Enables length-robust semantic grounding (sem_recall/precision/f1) alongside the lexical metrics.",
+        metavar="[NAME=]DIR",
+        help="sentence-transformers model dir for semantic grounding (sem_recall/precision/f1). "
+        "Repeatable — pass several to compare encoders side by side, e.g. "
+        "--semantic-model minilm=.../all-MiniLM-L6-v2 --semantic-model bge=.../bge-large-en-v1.5.",
     )
     ap.add_argument("--out", type=Path, default=None, help="Write the full JSON report here.")
     args = ap.parse_args()
@@ -1398,9 +1417,16 @@ def main() -> None:
     if fine_recs is not None:
         print(f"[loaded] fine-grained reference: {len(fine_recs)} windows from {args.fine_run}")
 
-    encode = build_semantic_encoder(args.semantic_model) if args.semantic_model else None
+    encoders: dict[str, Any] = {}
+    for spec in args.semantic_model or []:
+        name, _, path = spec.partition("=") if "=" in spec else ("", "", spec)
+        path_obj = Path(path)
+        model_name = name or path_obj.name
+        enc = build_semantic_encoder(path_obj)
+        if enc is not None:
+            encoders[model_name] = enc
 
-    report = build_report(runs, run_dirs, manual_gt, args.coverage_threshold, fine_recs, encode)
+    report = build_report(runs, run_dirs, manual_gt, args.coverage_threshold, fine_recs, encoders)
     print_summary(report)
 
     if args.out:
