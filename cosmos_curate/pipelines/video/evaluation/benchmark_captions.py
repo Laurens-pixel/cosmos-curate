@@ -294,8 +294,11 @@ def split_clauses(text: str) -> list[str]:
     a clause that matches no GT action lowers precision instead of being hidden inside one
     long blob. Clauses with fewer than two content words are dropped as non-substantive.
     """
+    # Keep any clause with at least one content word: a verb-only clause like "picks it up"
+    # carries one content token after stop-wording yet is a genuine sub-action — dropping it
+    # would collapse order detection.
     parts = _CLAUSE_SPLIT_RE.split(text)
-    return [p.strip() for p in parts if len(content_tokens(p)) >= 2]  # noqa: PLR2004
+    return [p.strip() for p in parts if content_tokens(p)]
 
 
 def build_semantic_encoder(model_path: Path) -> Any | None:  # noqa: ANN401 — returns a callable
@@ -758,6 +761,212 @@ def semantic_stats(recs: list[WindowRec], encode: Any) -> dict[str, Any]:  # noq
     }
 
 
+# ── Extended grounding: granularity, order, idle, robustness ───────────────────
+
+# A caption that asserts "nothing is happening" — credited on genuinely idle windows.
+_IDLE_RE = re.compile(
+    r"\b(no(?:thing| (?:action|activity|significant|movement|motion|change|object|interaction))"
+    r"|idle|stationary|remains? (?:still|stationary|idle)|stays? still|waiting|does not (?:move|interact)"
+    r"|not? interact|no one|empty)\b",
+    re.IGNORECASE,
+)
+
+
+def is_idle_caption(caption: str) -> bool:
+    """Return True if the caption asserts that no real action occurs."""
+    return bool(_IDLE_RE.search(caption))
+
+
+def bidirectional_containment(a: str, b: str) -> float:
+    """Granularity-aware lexical match: |A∩B| / min(|A|,|B|) on content tokens.
+
+    Full credit when the shorter phrase is contained in the longer one, so a *coarse*
+    caption ("vegetable") matching a *specific* GT ("purple eggplant") — and the reverse —
+    both score. Plain ``mention_recall`` only credits the GT→caption direction, so it
+    under-credits captions that are correct but less specific (or more specific) than GT.
+    """
+    sa, sb = set(content_tokens(a)), set(content_tokens(b))
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / min(len(sa), len(sb))
+
+
+def granularity_stats(recs: list[WindowRec]) -> dict[str, Any]:
+    """Recall under granularity-aware (bidirectional containment) matching vs strict.
+
+    The gap between ``granularity_aware_recall`` and the strict ``single_label_recall``
+    shows how much a model is penalised purely for naming objects at a different
+    granularity than the GT (coarse↔fine), not for being wrong.
+    """
+    aware: list[float] = []
+    for r in recs:
+        actions = _window_actions(r)
+        if not actions or not r.caption:
+            continue
+        aware.append(statistics.mean(bidirectional_containment(r.caption, a.get("action_text", "")) for a in actions))
+    return {"granularity_aware_recall": round(statistics.mean(aware), 4)} if aware else {}
+
+
+def idle_stats(recs: list[WindowRec], coverage_threshold: float) -> dict[str, Any]:
+    """Score idle/no-action windows separately so 'nothing happening' is judged on its merits.
+
+    A window is treated as *idle* when it has no GT action or its ``window_coverage`` is below
+    ``coverage_threshold``. Reports whether captions correctly say so, and how often captions
+    falsely claim idleness on active windows (a failure mode for over-cautious models).
+    """
+    idle_total = idle_correct = 0
+    active_total = active_false_idle = 0
+    for r in recs:
+        if not r.caption:
+            continue
+        actions = _window_actions(r)
+        cov = r.gt_extras.get("window_coverage")
+        is_idle_window = (not actions) or (isinstance(cov, (int, float)) and cov < coverage_threshold)
+        if is_idle_window:
+            idle_total += 1
+            idle_correct += int(is_idle_caption(r.caption))
+        else:
+            active_total += 1
+            active_false_idle += int(is_idle_caption(r.caption))
+    if idle_total == 0 and active_total == 0:
+        return {}
+    return {
+        "n_idle_windows": idle_total,
+        "idle_caption_recall": round(idle_correct / idle_total, 4) if idle_total else None,
+        "false_idle_rate_on_active": round(active_false_idle / active_total, 4) if active_total else None,
+    }
+
+
+def _concordance(positions: list[int | None]) -> float | None:
+    """Fraction of ordered pairs whose matched clause positions are non-decreasing.
+
+    ``positions[i]`` is the caption-clause index that best matches the i-th GT action (GT
+    actions already sorted in temporal order); ``None`` = that action wasn't matched. With
+    fewer than two matched actions the order is undefined → None.
+    """
+    idx = [(i, p) for i, p in enumerate(positions) if p is not None]
+    if len(idx) < 2:  # noqa: PLR2004
+        return None
+    pairs = concordant = 0
+    for a in range(len(idx)):
+        for b in range(a + 1, len(idx)):
+            pairs += 1
+            if idx[a][1] <= idx[b][1]:  # caption mentions them in the GT order
+                concordant += 1
+    return concordant / pairs if pairs else None
+
+
+def order_stats(recs: list[WindowRec], encode: Any | None = None) -> dict[str, Any]:  # noqa: ANN401
+    """Score temporal-order correctness: are actions mentioned in the GT order.
+
+    For windows with ≥2 temporally-ordered GT actions, each action is aligned to its
+    best-matching caption clause; ``order_consistency`` is the fraction of action pairs the
+    caption presents in the correct order. A caption saying "places then picks" when GT is
+    pick→place scores low here even if its bag-of-words recall is perfect. Computed lexically,
+    and semantically too when an encoder is supplied.
+    """
+    lex_vals: list[float] = []
+    sem_vals: list[float] = []
+    n_multi = 0
+
+    # Pre-embed clauses + actions once if semantic requested.
+    emb: dict[str, Any] = {}
+    if encode is not None:
+        texts: set[str] = set()
+        for r in recs:
+            actions = _window_actions(r)
+            if len([a for a in actions if a.get("action_text")]) >= 2 and r.caption:  # noqa: PLR2004
+                texts.update(split_clauses(r.caption) or [r.caption])
+                texts.update(a.get("action_text", "") for a in actions)
+        text_list = sorted(t for t in texts if t)
+        if text_list:
+            vecs = encode(text_list)
+            emb = {t: vecs[i] for i, t in enumerate(text_list)}
+
+    for r in recs:
+        actions = [a for a in _window_actions(r) if a.get("action_text")]
+        if len(actions) < 2 or not r.caption:  # noqa: PLR2004
+            continue
+        ordered = sorted(actions, key=lambda a: a.get("start_frame", 0))
+        clauses = split_clauses(r.caption) or [r.caption]
+        n_multi += 1
+
+        lex_pos: list[int | None] = []
+        for a in ordered:
+            scores = [bidirectional_containment(c, a.get("action_text", "")) for c in clauses]
+            lex_pos.append(max(range(len(clauses)), key=scores.__getitem__) if max(scores) > 0 else None)
+        c = _concordance(lex_pos)
+        if c is not None:
+            lex_vals.append(c)
+
+        if emb:
+            import numpy as np  # noqa: PLC0415 — only when semantic order requested
+
+            cvecs = np.stack([emb[x] for x in clauses if x in emb]) if any(x in emb for x in clauses) else None
+            sem_pos: list[int | None] = []
+            valid_clauses = [x for x in clauses if x in emb]
+            for a in ordered:
+                av = emb.get(a.get("action_text", ""))
+                if av is None or cvecs is None or len(valid_clauses) == 0:
+                    sem_pos.append(None)
+                    continue
+                sims = cvecs @ av
+                sem_pos.append(int(sims.argmax()) if float(sims.max()) > 0 else None)
+            c2 = _concordance(sem_pos)
+            if c2 is not None:
+                sem_vals.append(c2)
+
+    if n_multi == 0:
+        return {}
+    out: dict[str, Any] = {
+        "n_ordered_windows": n_multi,
+        "order_consistency_lexical": round(statistics.mean(lex_vals), 4) if lex_vals else None,
+    }
+    if encode is not None:
+        out["order_consistency_semantic"] = round(statistics.mean(sem_vals), 4) if sem_vals else None
+    return out
+
+
+def robustness_stats(recs: list[WindowRec], thresholds: tuple[float, ...] = (0.3, 0.5, 0.7)) -> dict[str, Any]:
+    """Threshold sensitivity of the binary hit-rate + per-window action-count distribution.
+
+    ``hit_rate@τ`` is recomputed at several match thresholds so a reader sees how much the
+    headline depends on the (otherwise arbitrary) 0.5 cutoff. ``actions_per_window`` exposes
+    how often windows span 1 / 2 / 3+ GT actions — i.e. how much the current segmentation
+    forces multi-action windows onto the caption metric.
+    """
+    by_threshold: dict[str, float | None] = {}
+    for t in thresholds:
+        vals: list[float] = []
+        for r in recs:
+            actions = _window_actions(r)
+            if not actions or not r.caption:
+                continue
+            per = [mention_recall(r.caption, a.get("action_text", "")) for a in actions]
+            vals.append(sum(1 for v in per if v >= t) / len(per))
+        by_threshold[f"hit_rate@{t}"] = round(statistics.mean(vals), 4) if vals else None
+
+    buckets = Counter()
+    for r in recs:
+        n = len(_window_actions(r))
+        if n:
+            buckets[min(n, 3)] += 1
+    total = sum(buckets.values())
+    dist = (
+        {
+            "windows_1_action": buckets.get(1, 0),
+            "windows_2_actions": buckets.get(2, 0),
+            "windows_3plus_actions": buckets.get(3, 0),
+            "mean_actions_per_window": round(
+                sum(len(_window_actions(r)) for r in recs if _window_actions(r)) / total, 3
+            ),
+        }
+        if total
+        else {}
+    )
+    return {"threshold_sensitivity": by_threshold, "actions_per_window": dist}
+
+
 # ── Metric: unsupervised adjacent-window consistency ───────────────────────────
 
 
@@ -998,6 +1207,10 @@ def build_report(
     per_run: dict[str, Any] = {}
     for name, recs in runs.items():
         grounding = grounding_stats(recs, coverage_threshold)
+        grounding.update(granularity_stats(recs))
+        grounding.update(idle_stats(recs, coverage_threshold))
+        grounding.update(order_stats(recs, encode))
+        grounding.update(robustness_stats(recs))
         if fine_recs:
             grounding.update(subaction_completeness(recs, fine_recs))
         if encode is not None:
@@ -1042,10 +1255,11 @@ def print_summary(report: dict[str, Any]) -> None:
         ("sem_f1", lambda r: r["grounding"].get("sem_f1")),
         ("sem_prec", lambda r: r["grounding"].get("sem_precision")),
         ("boundary", lambda r: r["grounding"].get("boundary_recall")),
-        ("subact_compl", lambda r: r["grounding"].get("subaction_completeness")),
+        ("order", lambda r: r["grounding"].get("order_consistency_lexical")),
+        ("granul", lambda r: r["grounding"].get("granularity_aware_recall")),
+        ("idle_rec", lambda r: r["grounding"].get("idle_caption_recall")),
         ("uniq", lambda r: r["captions"].get("unique_caption_ratio")),
         ("words", lambda r: r["captions"].get("mean_words")),
-        ("obj_cont", lambda r: r["consistency"].get("object_continuity")),
         ("contra", lambda r: r["consistency"].get("contradiction_rate")),
         ("quality", lambda r: r.get("quality_score")),
     ]

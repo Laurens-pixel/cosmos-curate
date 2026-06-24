@@ -29,6 +29,21 @@ from cosmos_curate.pipelines.video.utils.data_model import (
 )
 
 
+def _absolute_frame_range(video: Any, clip: Any, start_frame: int, end_frame: int) -> tuple[int, int]:  # noqa: ANN401
+    """Convert clip-local window frames to absolute source-video frames.
+
+    ``absolute = round(clip.span[0] * framerate) + local_frame``. Falls back to the local
+    frames unchanged when span/framerate are unavailable (e.g. whole-video fixed-stride
+    clips, where ``span[0] == 0`` anyway), so behaviour is identical for the common case.
+    """
+    span = getattr(clip, "span", None)
+    framerate = getattr(getattr(video, "metadata", None), "framerate", None)
+    if not span or not framerate:
+        return start_frame, end_frame
+    offset = round(float(span[0]) * float(framerate))
+    return start_frame + offset, end_frame + offset
+
+
 def _format_multi_action_gt(gt_text: str, gt_extras: dict[str, Any]) -> str:
     """Format GT for a text judge, listing *all* actions overlapping the window.
 
@@ -166,10 +181,19 @@ class JudgeStage(CuratorStage):
                     continue
 
                 video_path_str = str(video.input_video)
+                # Map clip-local window frames to ABSOLUTE source-video frames before GT
+                # lookup. GT action_config frames are absolute (full video); window frames
+                # are 0-indexed within their clip. When a video is split into multiple clips
+                # (e.g. TransNetV2 fires) these differ, and matching clip-local frames against
+                # absolute GT silently selects the wrong actions. Offsetting by the clip's
+                # start time decouples caption-quality scoring from segmentation: each caption
+                # is matched to the GT actions that truly overlap the clip it was given.
+                # For whole-video clips (fixed-stride) the offset is 0 — no behaviour change.
+                abs_start, abs_end = _absolute_frame_range(video, clip, window.start_frame, window.end_frame)
                 gt_text, gt_extras = self._gt_source.lookup(
                     video_path_str,
-                    window.start_frame,
-                    window.end_frame,
+                    abs_start,
+                    abs_end,
                 )
 
                 # Video-evidence judges (mp4_bytes) can watch the clip directly —
