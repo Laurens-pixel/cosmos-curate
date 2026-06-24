@@ -418,6 +418,109 @@ def load_run(run_dir: Path) -> list[WindowRec]:
     return recs
 
 
+# ── Offline GT from AgiBot task_info (no judgments needed) ──────────────────────
+
+_SIGNIFICANT_WINDOW_COVERAGE = 0.15
+_AGIBOT_VIDEO_RE = re.compile(r"(\d+)_(\d+)_")
+
+
+def _load_clip_offsets(run_dir: Path) -> dict[str, tuple[float, float]]:
+    """Map clip_uuid → (clip_start_seconds, framerate) from metas/v0/*.json."""
+    out: dict[str, tuple[float, float]] = {}
+    meta_dir = run_dir / "metas" / "v0"
+    if not meta_dir.is_dir():
+        return out
+    for p in meta_dir.glob("*.json"):
+        try:
+            d = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        uuid = str(d.get("span_uuid") or p.stem)
+        span = d.get("duration_span") or [0.0, 0.0]
+        fps = float(d.get("framerate_source") or d.get("framerate") or 30.0)
+        out[uuid] = (float(span[0]), fps)
+    return out
+
+
+def _load_gt_agibot(task_info_dir: Path) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Map (task_id, episode_id) → list of {start_frame, end_frame, action_text, skill}."""
+    out: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for task_file in Path(task_info_dir).glob("task_*.json"):
+        try:
+            episodes = json.loads(task_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        task_id = task_file.stem.split("_")[-1]
+        for ep in episodes:
+            ep_id = str(ep.get("episode_id", ""))
+            out[(task_id, ep_id)] = ep.get("label_info", {}).get("action_config", [])
+    return out
+
+
+def _gt_extras_for_window(abs_start: int, abs_end: int, actions: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    """Mirror AgibotTaskInfoGt.lookup offline: all overlapping actions + coverage for a window."""
+    window_len = max(1, abs_end - abs_start)
+    overlapping: list[dict[str, Any]] = []
+    for entry in actions:
+        s, e = int(entry.get("start_frame", 0)), int(entry.get("end_frame", 0))
+        overlap = max(0, min(e, abs_end) - max(s, abs_start))
+        if overlap <= 0:
+            continue
+        overlapping.append(
+            {
+                "action_text": str(entry.get("action_text", "")),
+                "skill": str(entry.get("skill", "")),
+                "start_frame": s,
+                "end_frame": e,
+                "overlap_frames": overlap,
+                "window_coverage": round(overlap / window_len, 4),
+                "action_coverage": round(overlap / max(1, e - s), 4),
+            }
+        )
+    if not overlapping:
+        return "", {}
+    overlapping.sort(key=lambda a: a["overlap_frames"], reverse=True)
+    total = min(1.0, sum(a["overlap_frames"] for a in overlapping) / window_len)
+    n_sig = sum(1 for a in overlapping if a["window_coverage"] >= _SIGNIFICANT_WINDOW_COVERAGE)
+    extras = {
+        "gt_skill": overlapping[0]["skill"],
+        "all_actions": overlapping,
+        "window_coverage": round(total, 4),
+        "is_transition": n_sig >= 2,  # noqa: PLR2004
+        "num_overlapping_actions": len(overlapping),
+    }
+    return overlapping[0]["action_text"], extras
+
+
+def attach_gt_from_task_info(recs: list[WindowRec], run_dir: Path, task_info_dir: Path) -> int:
+    """Populate each window's GT from AgiBot task_info, independent of any judgments.
+
+    Converts clip-local window frames to absolute source frames using the clip start time
+    (metas ``duration_span``) so it works for split clips too. Returns the number of windows
+    that received GT. Lets the GT-based metrics (grounding/semantic/order) run on caption
+    runs that were never judged (e.g. Gemma4), so different caption models can be compared
+    on equal, GT-anchored footing.
+    """
+    offsets = _load_clip_offsets(run_dir)
+    gt = _load_gt_agibot(task_info_dir)
+    n = 0
+    for r in recs:
+        m = _AGIBOT_VIDEO_RE.search(Path(r.source_video).name)
+        if not m:
+            continue
+        actions = gt.get((m.group(1), m.group(2)))
+        if not actions:
+            continue
+        clip_start_s, fps = offsets.get(r.clip_uuid, (0.0, 30.0))
+        frame_offset = round(clip_start_s * fps)
+        text, extras = _gt_extras_for_window(r.start_frame + frame_offset, r.end_frame + frame_offset, actions)
+        if text:
+            r.gt_action_text = text
+            r.gt_extras = extras
+            n += 1
+    return n
+
+
 # ── Metric: descriptive caption stats ──────────────────────────────────────────
 
 
@@ -1393,6 +1496,14 @@ def main() -> None:
         "Repeatable — pass several to compare encoders side by side, e.g. "
         "--semantic-model minilm=.../all-MiniLM-L6-v2 --semantic-model bge=.../bge-large-en-v1.5.",
     )
+    ap.add_argument(
+        "--gt-task-info",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="AgiBot task_info dir. When set, GT is read directly from it (not from judgments), "
+        "so GT-based metrics work on caption runs that were never judged (e.g. Gemma4).",
+    )
     ap.add_argument("--out", type=Path, default=None, help="Write the full JSON report here.")
     args = ap.parse_args()
 
@@ -1407,7 +1518,11 @@ def main() -> None:
     for name, d in run_dirs.items():
         recs = load_run(d)
         runs[name] = recs
-        print(f"[loaded] {name}: {len(recs)} windows from {d}")
+        if args.gt_task_info:
+            n_gt = attach_gt_from_task_info(recs, d, args.gt_task_info)
+            print(f"[loaded] {name}: {len(recs)} windows from {d} ({n_gt} with GT from task_info)")
+        else:
+            print(f"[loaded] {name}: {len(recs)} windows from {d}")
 
     manual_gt = load_manual_gt(args.manual_gt) if args.manual_gt else None
     if manual_gt is not None:
