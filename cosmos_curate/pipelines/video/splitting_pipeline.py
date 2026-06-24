@@ -67,6 +67,8 @@ from cosmos_curate.pipelines.video.clipping.phases import (
     FixedStrideSplitPhase,
     FrameExtractionConfig,
     FrameExtractionPhase,
+    ShotBoundarySplitConfig,
+    ShotBoundarySplitPhase,
     TranscodeConfig,
     TranscodePhase,
     TransNetV2SplitConfig,
@@ -323,30 +325,51 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 )
             )
         )
-    elif args.splitting_algorithm == "transnetv2":
-        # TransNetV2 is a neural-network based shot-detection algorithm
-        # that takes strided windows of ~100 frames and detects whether
-        # a given frame is a scene transition or not.
-        # See https://arxiv.org/abs/2008.04838 for more details.
-        builder.add_phase(
-            TransNetV2SplitPhase(
-                TransNetV2SplitConfig(
-                    threshold=args.transnetv2_threshold,
-                    min_length_s=args.transnetv2_min_length_s,
-                    min_length_frames=args.transnetv2_min_length_frames,
-                    max_length_s=args.transnetv2_max_length_s,
-                    max_length_mode=args.transnetv2_max_length_mode,
-                    crop_s=args.transnetv2_crop_s,
-                    num_gpus_per_worker=args.transnetv2_gpus_per_worker,
-                    decoder_mode=args.transnetv2_frame_decoder_mode,
-                    num_decode_cpus_per_worker=args.transnetv2_frame_decode_cpus_per_worker,
-                    raise_on_pynvc_error=args.transnetv2_frame_decode_raise_on_pynvc_error,
-                    limit_clips=args.limit_clips,
-                    verbose=args.verbose,
-                    perf_profile=args.perf_profile,
+    elif args.splitting_algorithm == "shot-boundary":
+        if args.shot_boundary_model == "transnetv2":
+            builder.add_phase(
+                TransNetV2SplitPhase(
+                    TransNetV2SplitConfig(
+                        threshold=args.transnetv2_threshold,
+                        min_length_s=args.transnetv2_min_length_s,
+                        min_length_frames=args.transnetv2_min_length_frames,
+                        max_length_s=args.transnetv2_max_length_s,
+                        max_length_mode=args.transnetv2_max_length_mode,
+                        crop_s=args.transnetv2_crop_s,
+                        num_gpus_per_worker=args.transnetv2_gpus_per_worker,
+                        decoder_mode=args.transnetv2_frame_decoder_mode,
+                        num_decode_cpus_per_worker=args.transnetv2_frame_decode_cpus_per_worker,
+                        raise_on_pynvc_error=args.transnetv2_frame_decode_raise_on_pynvc_error,
+                        limit_clips=args.limit_clips,
+                        verbose=args.verbose,
+                        perf_profile=args.perf_profile,
+                    )
                 )
             )
-        )
+        else:
+            builder.add_phase(
+                ShotBoundarySplitPhase(
+                    ShotBoundarySplitConfig(
+                        model=args.shot_boundary_model,
+                        min_length_s=args.transnetv2_min_length_s,
+                        min_length_frames=args.transnetv2_min_length_frames,
+                        max_length_s=args.transnetv2_max_length_s,
+                        max_length_mode=args.transnetv2_max_length_mode,
+                        crop_s=args.transnetv2_crop_s,
+                        limit_clips=args.limit_clips,
+                        verbose=args.verbose,
+                        perf_profile=args.perf_profile,
+                        pyscenedetect_threshold=args.pyscenedetect_threshold,
+                        pyscenedetect_min_scene_len_frames=args.pyscenedetect_min_scene_len_frames,
+                        pyscenedetect_num_cpus_per_worker=args.pyscenedetect_cpus_per_worker,
+                        sample_fps=args.shot_boundary_sample_fps,
+                        alpha=args.shot_boundary_alpha,
+                        tpivot_grid_size=args.tpivot_grid_size,
+                        tpivot_iterations=args.tpivot_iterations,
+                        vlm_max_new_tokens=args.shot_boundary_vlm_max_new_tokens,
+                    )
+                )
+            )
     else:
         error_msg = f"{args.splitting_algorithm} algorithm type not implemented."
         raise NotImplementedError(error_msg)
@@ -984,9 +1007,65 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     parser.add_argument(
         "--splitting-algorithm",
         type=str,
+        default="shot-boundary",
+        choices=["fixed-stride", "shot-boundary"],
+        help=(
+            "Splitting strategy: 'shot-boundary' detects cut points then builds clips; "
+            "'fixed-stride' splits by fixed duration (for pre-segmented inputs)."
+        ),
+    )
+    parser.add_argument(
+        "--shot-boundary-model",
+        type=str,
         default="transnetv2",
-        choices=["fixed-stride", "transnetv2"],
-        help="Splitting algorithm to use on full videos.",
+        dest="shot_boundary_model",
+        choices=[
+            "transnetv2",
+            "pyscenedetect",
+            "semantic_clip",
+            "semantic_siglip2",
+            "semantic_dinov2",
+            "semantic_vjepa2",
+            "tpivot_glm4v",
+            "tpivot_internvl3",
+            "tpivot_qwen3",
+            "tpivot_molmo2",
+        ],
+        help=(
+            "Boundary detector when --splitting-algorithm=shot-boundary. "
+            "Class A: transnetv2, pyscenedetect. "
+            "Class B: semantic_*. Class C: tpivot_*."
+        ),
+    )
+    parser.add_argument(
+        "--shot-boundary-sample-fps",
+        type=float,
+        default=2.0,
+        help="Sampling FPS for semantic/VLM boundary models.",
+    )
+    parser.add_argument(
+        "--shot-boundary-alpha",
+        type=float,
+        default=0.4,
+        help="ABD smoothing/threshold sensitivity for semantic_* backends (higher = fewer boundaries).",
+    )
+    parser.add_argument(
+        "--tpivot-grid-size",
+        type=int,
+        default=5,
+        help="Grid size (NxN) for tpivot_* backends.",
+    )
+    parser.add_argument(
+        "--tpivot-iterations",
+        type=int,
+        default=4,
+        help="Refinement iterations for tpivot_* backends (use 1 for single-pass, no window narrowing).",
+    )
+    parser.add_argument(
+        "--shot-boundary-vlm-max-new-tokens",
+        type=int,
+        default=256,
+        help="Max generation tokens for tpivot_* backends.",
     )
     parser.add_argument(
         "--fixed-stride-split-duration",
@@ -1082,6 +1161,33 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         type=float,
         default=0.25,
         help="Number of GPUs per worker for TransNetV2 splitting stage.",
+    )
+    parser.add_argument(
+        "--pyscenedetect-threshold",
+        type=float,
+        default=27.0,
+        help=(
+            "PySceneDetect ContentDetector threshold used when "
+            "--shot-boundary-model=pyscenedetect."
+        ),
+    )
+    parser.add_argument(
+        "--pyscenedetect-min-scene-len-frames",
+        type=int,
+        default=15,
+        help=(
+            "Minimum scene length in frames for PySceneDetect when "
+            "--shot-boundary-model=pyscenedetect."
+        ),
+    )
+    parser.add_argument(
+        "--pyscenedetect-cpus-per-worker",
+        type=float,
+        default=2.0,
+        help=(
+            "CPU allocation per worker for PySceneDetect boundary detection when "
+            "--shot-boundary-model=pyscenedetect."
+        ),
     )
     parser.add_argument(
         "--transcode-cpus-per-worker",

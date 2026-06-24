@@ -26,6 +26,9 @@ from cosmos_curate.pipelines.video.clipping.clip_extraction_stages import (
 )
 from cosmos_curate.pipelines.video.clipping.clip_frame_extraction_stages import ClipFrameExtractionStage
 from cosmos_curate.pipelines.video.clipping.frame_extraction_stages import VideoFrameExtractionStage
+from cosmos_curate.pipelines.video.clipping.model_boundary_extraction_stages import ModelBoundaryClipExtractionStage
+from cosmos_curate.pipelines.video.clipping.pyscenedetect_extraction_stages import PySceneDetectClipExtractionStage
+from cosmos_curate.pipelines.video.clipping.shot_boundary_models import DetectorConfig
 from cosmos_curate.pipelines.video.clipping.transnetv2_extraction_stages import TransNetV2ClipExtractionStage
 from cosmos_curate.pipelines.video.utils.decoder_utils import FrameExtractionPolicy
 
@@ -138,6 +141,121 @@ class TransNetV2SplitPhase(CurationPhase):
                 over_provision_factor=2.0,
             ),
         ]
+
+
+@attrs.define(frozen=True)
+class ShotBoundarySplitConfig:
+    """Configuration for pluggable shot-boundary-based split detectors."""
+
+    model: Literal[
+        "pyscenedetect",
+        "semantic_clip",
+        "semantic_siglip2",
+        "semantic_dinov2",
+        "semantic_vjepa2",
+        "tpivot_glm4v",
+        "tpivot_internvl3",
+        "tpivot_qwen3",
+        "tpivot_molmo2",
+    ] = "pyscenedetect"
+    # Shared clip filtering / shaping
+    min_length_s: float = 2.0
+    min_length_frames: int = 48
+    max_length_s: float = 60.0
+    max_length_mode: Literal["truncate", "stride"] = "stride"
+    crop_s: float = 0.5
+    limit_clips: int = 0
+    verbose: bool = False
+    perf_profile: bool = False
+    # PySceneDetect-specific
+    pyscenedetect_threshold: float = 27.0
+    pyscenedetect_min_scene_len_frames: int = 15
+    pyscenedetect_num_cpus_per_worker: float = 2.0
+    # Semantic / VLM detector controls
+    sample_fps: float = 2.0
+    alpha: float = 0.4
+    tpivot_grid_size: int = 5
+    tpivot_iterations: int = 4
+    vlm_max_new_tokens: int = 256
+
+
+class ShotBoundarySplitPhase(CurationPhase):
+    """Split videos into clips using a pluggable shot-boundary detector."""
+
+    def __init__(self, config: ShotBoundarySplitConfig) -> None:
+        self._cfg = config
+
+    @property
+    def name(self) -> str:
+        return f"split/shot-boundary/{self._cfg.model}"
+
+    @property
+    def requires(self) -> frozenset[str]:
+        return frozenset({"remuxed"})
+
+    @property
+    def populates(self) -> frozenset[str]:
+        return frozenset({"split"})
+
+    def build_stages(self) -> list[CuratorStage | CuratorStageSpec]:
+        cfg = self._cfg
+        if cfg.model == "pyscenedetect":
+            return [
+                CuratorStageSpec(
+                    PySceneDetectClipExtractionStage(
+                        threshold=cfg.pyscenedetect_threshold,
+                        min_scene_len_frames=cfg.pyscenedetect_min_scene_len_frames,
+                        min_length_s=cfg.min_length_s,
+                        min_length_frames=cfg.min_length_frames,
+                        max_length_s=cfg.max_length_s,
+                        max_length_mode=cfg.max_length_mode,
+                        crop_s=cfg.crop_s,
+                        num_cpus_per_worker=cfg.pyscenedetect_num_cpus_per_worker,
+                        limit_clips=cfg.limit_clips,
+                        verbose=cfg.verbose,
+                        log_stats=cfg.perf_profile,
+                    )
+                ),
+            ]
+        if cfg.model in {
+            "semantic_clip",
+            "semantic_siglip2",
+            "semantic_dinov2",
+            "semantic_vjepa2",
+            "tpivot_glm4v",
+            "tpivot_internvl3",
+            "tpivot_qwen3",
+            "tpivot_molmo2",
+        }:
+            detector_cfg = DetectorConfig(
+                sample_fps=cfg.sample_fps,
+                alpha=cfg.alpha,
+                tpivot_grid_size=cfg.tpivot_grid_size,
+                tpivot_iterations=cfg.tpivot_iterations,
+                vlm_max_new_tokens=cfg.vlm_max_new_tokens,
+                pyscenedetect_threshold=cfg.pyscenedetect_threshold,
+                pyscenedetect_min_scene_len_frames=cfg.pyscenedetect_min_scene_len_frames,
+            )
+            return [
+                CuratorStageSpec(
+                    ModelBoundaryClipExtractionStage(
+                        model_name=cfg.model,
+                        detector_config=detector_cfg,
+                        min_length_s=cfg.min_length_s,
+                        min_length_frames=cfg.min_length_frames,
+                        max_length_s=cfg.max_length_s,
+                        max_length_mode=cfg.max_length_mode,
+                        crop_s=cfg.crop_s,
+                        num_cpus_per_worker=cfg.pyscenedetect_num_cpus_per_worker,
+                        num_gpus_per_worker=1.0,
+                        limit_clips=cfg.limit_clips,
+                        verbose=cfg.verbose,
+                        log_stats=cfg.perf_profile,
+                    )
+                ),
+            ]
+        msg = f"Unsupported shot boundary model: {cfg.model}"
+        raise ValueError(msg)
 
 
 class FixedStrideSplitPhase(CurationPhase):
