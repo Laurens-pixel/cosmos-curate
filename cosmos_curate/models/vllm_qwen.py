@@ -29,6 +29,9 @@ if TYPE_CHECKING:
 
 
 MAX_MODEL_LEN = 32768
+# 30B MoE weights leave ~8 GB free on an A100 40 GB; capping context to 20 k
+# keeps the KV-cache within that budget (vLLM reports max ≈21712 at this size).
+MAX_MODEL_LEN_30B = 20000
 GPU_MEMORY_UTILIZATION = 0.85
 MAX_NUM_BATCHED_TOKENS = 32768
 DEFAULT_BATCH_SIZE = 16
@@ -331,6 +334,22 @@ class VllmQwen3VL30B(VllmQwen3VL):
         """Return the model variant name."""
         return "qwen3_vl_30b"
 
+    @classmethod
+    def model(cls, config: VllmConfig) -> LLM:
+        """Instantiate the vLLM model with a 30-B-appropriate context length."""
+        return LLM(
+            model=str(cls.model_path(config)),
+            limit_mm_per_prompt=LIMIT_MM_PER_PROMPT,
+            max_model_len=MAX_MODEL_LEN_30B,
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+            pipeline_parallel_size=1,
+            mm_processor_cache_gb=0.0 if config.disable_mmcache else 4.0,
+            tensor_parallel_size=config.num_gpus,
+            trust_remote_code=TRUST_REMOTE_CODE,
+            compilation_config={"cudagraph_mode": "piecewise"},
+            performance_mode=config.performance_mode,
+        )
+
 
 class VllmQwen3VL30BFP8(VllmQwen3VL):
     """Qwen3-VL-30B-A3B-Instruct-FP8 vLLM model variant plugin."""
@@ -339,6 +358,22 @@ class VllmQwen3VL30BFP8(VllmQwen3VL):
     def model_variant() -> str:
         """Return the model variant name."""
         return "qwen3_vl_30b_fp8"
+
+    @classmethod
+    def model(cls, config: VllmConfig) -> LLM:
+        """Instantiate the vLLM model with a 30-B-appropriate context length."""
+        return LLM(
+            model=str(cls.model_path(config)),
+            limit_mm_per_prompt=LIMIT_MM_PER_PROMPT,
+            max_model_len=MAX_MODEL_LEN_30B,
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+            pipeline_parallel_size=1,
+            mm_processor_cache_gb=0.0 if config.disable_mmcache else 4.0,
+            tensor_parallel_size=config.num_gpus,
+            trust_remote_code=TRUST_REMOTE_CODE,
+            compilation_config={"cudagraph_mode": "piecewise"},
+            performance_mode=config.performance_mode,
+        )
 
 
 class VllmQwen3VL235B(VllmQwen3VL):

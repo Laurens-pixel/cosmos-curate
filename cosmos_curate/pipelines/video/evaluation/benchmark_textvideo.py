@@ -134,6 +134,11 @@ def build_vision_text_encoder(model_path: Path, model_kind: str) -> Any | None: 
     processor = AutoProcessor.from_pretrained(str(resolved), local_files_only=True)
     text_pad = "max_length" if model_kind == "siglip" else True
 
+    import numpy as _np  # noqa: PLC0415
+
+    _IMG_CHUNK = 32   # windows per GPU call (8 frames each → 256 images max)
+    _TXT_CHUNK = 256  # texts per GPU call
+
     class _Encoder:
         def encode_images(self, images: list[Any]) -> Any:  # noqa: ANN401
             inp = processor(images=images, return_tensors="pt").to(device)
@@ -142,12 +147,33 @@ def build_vision_text_encoder(model_path: Path, model_kind: str) -> Any | None: 
             feats = feats / feats.norm(dim=-1, keepdim=True)
             return feats.cpu().numpy().astype("float32")
 
+        def encode_images_batched(self, frame_batches: list[list[Any]]) -> Any:  # noqa: ANN401
+            """Encode many windows' frames in chunks to avoid OOM."""
+            parts = []
+            for start in range(0, len(frame_batches), _IMG_CHUNK):
+                chunk_frames = [f for window in frame_batches[start : start + _IMG_CHUNK] for f in window]
+                chunk_n = len(frame_batches[start : start + _IMG_CHUNK])
+                inp = processor(images=chunk_frames, return_tensors="pt").to(device)
+                with torch.no_grad():
+                    feats = model.get_image_features(**inp)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                feats_np = feats.cpu().numpy().astype("float32")
+                n_per = len(chunk_frames) // chunk_n
+                for i in range(chunk_n):
+                    parts.append(feats_np[i * n_per : (i + 1) * n_per].mean(axis=0))
+            return _np.stack(parts) if parts else _np.zeros((0, 0), dtype="float32")
+
         def encode_texts(self, texts: list[str]) -> Any:  # noqa: ANN401
-            inp = processor(text=texts, padding=text_pad, truncation=True, return_tensors="pt").to(device)
-            with torch.no_grad():
-                feats = model.get_text_features(**inp)
-            feats = feats / feats.norm(dim=-1, keepdim=True)
-            return feats.cpu().numpy().astype("float32")
+            """Encode texts in chunks to avoid OOM on large runs."""
+            parts = []
+            for start in range(0, len(texts), _TXT_CHUNK):
+                chunk = texts[start : start + _TXT_CHUNK]
+                inp = processor(text=chunk, padding=text_pad, truncation=True, return_tensors="pt").to(device)
+                with torch.no_grad():
+                    feats = model.get_text_features(**inp)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                parts.append(feats.cpu().numpy().astype("float32"))
+            return _np.concatenate(parts, axis=0) if parts else _np.zeros((0, 0), dtype="float32")
 
     print(f"[textvideo] loaded {model_kind} encoder from {resolved} on {device}")
     return _Encoder()
@@ -212,20 +238,18 @@ def score_run(
     if not keep:
         return {"n_scored": 0, "n_skipped": n_skipped}
 
-    # Embed (batched per window for frames; one batch for all captions/gt).
-    vid_embs = [encoder.encode_images(frames).mean(axis=0) for frames in frame_batches]
-    vid = np.stack([v / (np.linalg.norm(v) + 1e-8) for v in vid_embs])
+    # Embed in chunks to avoid OOM on large runs (15k+ windows).
+    vid = encoder.encode_images_batched(frame_batches)
     cap = encoder.encode_texts(cap_texts)
     gt_mask = [bool(t.strip()) for t in gt_texts]
     gt = encoder.encode_texts([t if t.strip() else "." for t in gt_texts])
 
     for i in range(len(keep)):
-        cap_embs.append(cap[i])
         clip_ids.append(keep[i].clip_uuid)
         if gt_mask[i]:
             gt_sims.append(float(gt[i] @ vid[i]))
 
-    cap = np.stack([c / (np.linalg.norm(c) + 1e-8) for c in cap_embs])
+    # cap is already L2-normalised by encode_texts
     caption_video_sim = [float(cap[i] @ vid[i]) for i in range(len(keep))]
 
     # Retrieval: video query → all captions. sim matrix (N_videos x N_captions).
