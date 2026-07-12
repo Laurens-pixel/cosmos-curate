@@ -136,6 +136,10 @@ class Window:
     # `caption: {model_name: caption}`
     caption: dict[str, str] = attrs.Factory(dict)
     enhanced_caption: dict[str, str] = attrs.Factory(dict)
+    # Reasoning trace: model_variant -> chain-of-thought text. Populated only by
+    # reasoning models (e.g. Cosmos-Reason's <think> block); kept separate from the
+    # caption so grounding metrics see the answer alone while the reasoning stays inspectable.
+    reasoning: dict[str, str] = attrs.Factory(dict)
     # Judge results: judge_variant -> {verdict, score, explanation, gt_action_text, raw_output, ...}
     judge: dict[str, dict[str, Any]] = attrs.Factory(dict)
     # t5_xxl embeddings for this window
@@ -200,6 +204,8 @@ class Clip:
     qwen_type_classification: list[str] | None = None
     # When clip is in filtered_clips due to Qwen: "classifier" (type allow/block) or "semantic" (criteria filter)
     qwen_rejection_stage: str | None = None
+    # Macrodata Class D: subtask label from VLM segmentation (side-effect of boundary detection)
+    subtask_label: str | None = None
 
     def get_all_captions(self) -> list[str]:
         """Get all captions from the clip's windows.
@@ -845,6 +851,14 @@ class VllmSamplingConfig:
         top_k: Top-k sampling parameter (0 = disabled).
         min_p: Minimum probability threshold for sampling.
         max_tokens: Maximum number of tokens to generate (None = no limit).
+        num_candidates: Number of independent completions to sample per request
+            (self-consistency decoding, Wang et al. 2023). 1 = single near-greedy
+            completion (previous behaviour). >1 samples that many reasoning paths —
+            the video prefill is shared, only text continuations differ — and the
+            plugin's ``decode`` selects the majority-consistent answer.
+        candidate_temperature: Sampling temperature used when num_candidates > 1
+            (diversity across reasoning paths is required for voting to work).
+        candidate_top_p: Nucleus threshold used when num_candidates > 1.
 
     """
 
@@ -856,6 +870,9 @@ class VllmSamplingConfig:
     top_k: int = 0
     min_p: float = 0.0
     max_tokens: int | None = 8192  # vLLM default is None
+    num_candidates: int = 1
+    candidate_temperature: float = 0.7
+    candidate_top_p: float = 0.9
 
 
 @attrs.define
@@ -952,3 +969,5 @@ class VllmCaptionRequest:
     inputs: dict[str, Any]
     caption: str | None = None
     stage2_prompt: str | None = None
+    # Reasoning trace decoded alongside the caption (reasoning models only); None otherwise.
+    reasoning: str | None = None

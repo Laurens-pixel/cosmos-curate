@@ -131,6 +131,25 @@ _PROMPTS = {
     }
     ```
     """,
+    "robot_reason": """
+    Describe what happens in this short robot point-of-view clip in detail, getting the object
+    identity and the action exactly right.
+
+    First reason about what the object is from its visible features; then write a detailed,
+    factual caption. Cover the specific object being manipulated, the action and its phases, the
+    spatial context, and the outcome. Rich, concrete visual detail is welcome — it is useful for
+    downstream tasks — provided every detail is actually visible in the clip.
+
+    Output a single JSON object and nothing else:
+    {"caption": "<a detailed, factual description naming the specific object, the action, and the outcome>", "action": "<the main action verb>", "object": "<the specific object being manipulated, or null if none>"}
+
+    Rules:
+    - Name the object as specifically as the visual evidence supports. If the exact type is
+      unclear, describe its distinguishing visible features (shape, colour, size, texture)
+      rather than guessing a common object.
+    - Include only detail you can actually see. Do NOT invent objects, attributes, or actions,
+      and do not infer intent — everything written must be grounded in the video.
+    """,
     "inhard": """
     You are an industrial assembly video captioner. You will receive short clips from a
     factory assembly task recorded from a fixed overhead camera and must produce a concise,
@@ -186,6 +205,33 @@ _DEFAULT_STAGE2_PROMPT = """
 Improve and refine following video description. Focus on highlighting the key visual and sensory elements.
 Ensure the description is clear, precise, and paints a compelling picture of the scene.
 """
+
+
+# Named stage-2 prompts, selectable by name via ``--qwen-stage2-prompt-text <name>``.
+#
+# ``verify`` implements self-verification (a "Self-Refine"-style second pass): the reasoning
+# model re-watches the same clip together with its own first-pass description and is asked to
+# critically re-examine the object identity and action, correcting any error. Unlike the default
+# "make it more vivid" refinement (which inflates verbosity and can add ungrounded detail), this
+# is designed to raise factual accuracy — it is the intended way to use a reasoning VLM's second
+# pass. It is domain-general: it names no specific objects, it instructs the model to reason from
+# visible physical features, so it transfers to any manipulation domain unchanged.
+_STAGE2_PROMPTS: dict[str, str] = {
+    "verify": """
+Re-watch the clip and critically verify the description below before finalising it. Do not simply
+restate it — check it against what is actually visible:
+- Object: look again at the manipulated object's shape, colour, size, texture, and any markings.
+  Is it named correctly and as specifically as the evidence supports? If the evidence points to a
+  different object, correct it. If the exact type cannot be determined, describe its distinguishing
+  features instead of guessing.
+- Action: confirm the action and its phase (approach, reach, grasp, lift, move, place, release,
+  idle) are correct.
+- Remove anything not actually visible.
+Output only a single JSON object: {"caption": "<corrected concise caption>", "action": "<verb>", "object": "<specific object or null>"}.
+
+Description to verify:
+""",
+}
 
 
 def get_prompt(
@@ -251,13 +297,16 @@ def get_stage2_prompt(prompt: str | None) -> str:
     """Get the stage 2 prompt.
 
     Args:
-        prompt: The text of the stage 2 prompt. If None, the default stage 2
-            prompt will be used.
+        prompt: The stage-2 prompt selector. If None, the default refinement prompt is used.
+            If it matches a key in ``_STAGE2_PROMPTS`` (e.g. ``"verify"``), that named prompt is
+            returned. Otherwise it is treated as literal prompt text.
 
     Returns:
         The stage 2 prompt.
 
     """
-    if prompt is not None:
-        return prompt
-    return _DEFAULT_STAGE2_PROMPT.strip() + "\n"
+    if prompt is None:
+        return _DEFAULT_STAGE2_PROMPT.strip() + "\n"
+    if prompt in _STAGE2_PROMPTS:
+        return _STAGE2_PROMPTS[prompt].strip() + "\n"
+    return prompt

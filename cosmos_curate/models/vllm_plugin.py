@@ -201,3 +201,22 @@ class VllmPlugin(ABC):
             A caption string.
 
         """
+
+    @staticmethod
+    def decode_reasoning(vllm_output: RequestOutput) -> str | None:
+        """Return the model's reasoning trace, if it emits one separately from the answer.
+
+        Most models do not produce an inspectable reasoning trace, so the default returns
+        None. Reasoning models (e.g. Cosmos-Reason, which wraps its chain-of-thought in a
+        ``<think>...</think>`` block) override this to return that text. It is stored apart
+        from the caption so the caption used for grounding stays clean while the reasoning
+        remains available for inspection.
+
+        Args:
+            vllm_output: The output from vllm_generate
+
+        Returns:
+            The reasoning trace, or None if the model does not expose one.
+
+        """
+        return None

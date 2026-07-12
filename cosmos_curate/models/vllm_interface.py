@@ -236,6 +236,12 @@ def vllm_model(config: VllmConfig) -> LLM:
 def sampling_params(config: VllmSamplingConfig) -> SamplingParams:
     """Create a sampling parameters object for the vLLM model.
 
+    When ``num_candidates > 1`` (self-consistency decoding), vLLM samples that many
+    completions per request (``n=K``) — sharing the expensive video prefill — and the
+    temperature/top_p switch to the candidate values, since diverse reasoning paths are
+    a precondition for majority voting. With ``num_candidates == 1`` the behaviour is
+    unchanged (near-greedy single completion).
+
     Args:
         config: Configuration for the vLLM model.
 
@@ -243,9 +249,11 @@ def sampling_params(config: VllmSamplingConfig) -> SamplingParams:
         A sampling parameters object.
 
     """
+    self_consistency = config.num_candidates > 1
     return SamplingParams(
-        temperature=config.temperature,
-        top_p=config.top_p,
+        n=config.num_candidates,
+        temperature=config.candidate_temperature if self_consistency else config.temperature,
+        top_p=config.candidate_top_p if self_consistency else config.top_p,
         top_k=config.top_k,
         repetition_penalty=config.repetition_penalty,
         presence_penalty=config.presence_penalty,
@@ -445,6 +453,7 @@ def process_vllm_output(
         if out.finished:
             request = in_flight_requests[out.request_id]
             request.caption = vllm_plugin.decode(out)
+            request.reasoning = vllm_plugin.decode_reasoning(out)
             finished.append(request)
 
     return finished
@@ -457,7 +466,7 @@ def _caption_no_inflight_batching(  # noqa: PLR0913
     sampling_params: SamplingParams,
     vllm_config: VllmConfig,
     stage2_prompts: list[str | None],
-) -> list[str]:
+) -> tuple[list[str], list[str | None]]:
     """Caption the videos without inflight batching.
 
     Assumption:
@@ -474,7 +483,8 @@ def _caption_no_inflight_batching(  # noqa: PLR0913
            Assumed to be the same length as model_inputs.
 
     Returns:
-        Captions for each video.
+        A tuple ``(captions, reasonings)`` aligned to the input order. ``reasonings[i]``
+        is None for non-reasoning models.
 
     """
     vllm_plugin = _get_vllm_plugin(vllm_config.model_variant)
@@ -508,10 +518,12 @@ def _caption_no_inflight_batching(  # noqa: PLR0913
     finished_s1 = _process_requests(requests)
 
     results: dict[int, str] = {}
+    reasonings: dict[int, str | None] = {}
     needs_stage2 = []
     for r in finished_s1:
         if r.stage2_prompt is None:
             results[request_id_to_index[r.request_id]] = r.caption or "Unknown caption"
+            reasonings[request_id_to_index[r.request_id]] = r.reasoning
         else:
             needs_stage2.append(r)
 
@@ -522,8 +534,12 @@ def _caption_no_inflight_batching(  # noqa: PLR0913
 
     for r in _process_requests(refine_requests):
         results[request_id_to_index[r.request_id]] = r.caption or "Unknown caption"
+        reasonings[request_id_to_index[r.request_id]] = r.reasoning
 
-    return [results[i] for i in range(len(requests))]
+    return (
+        [results[i] for i in range(len(requests))],
+        [reasonings.get(i) for i in range(len(requests))],
+    )
 
 
 def _caption_inflight_batching(  # noqa: PLR0913
@@ -534,7 +550,7 @@ def _caption_inflight_batching(  # noqa: PLR0913
     vllm_config: VllmConfig,
     max_inflight_requests: int,
     stage2_prompts: list[str | None],
-) -> list[str]:
+) -> tuple[list[str], list[str | None]]:
     """Caption the videos using inflight batching.
 
     Assumption:
@@ -553,13 +569,15 @@ def _caption_inflight_batching(  # noqa: PLR0913
            Assumed to be the same length as model_inputs.
 
     Returns:
-        Captions for each video.
+        A tuple ``(captions, reasonings)`` aligned to the input order. ``reasonings[i]``
+        is None for non-reasoning models.
 
     """
     vllm_plugin = _get_vllm_plugin(vllm_config.model_variant)
     request_q: Deque[VllmCaptionRequest] = deque()  # noqa: UP006, remove noqa when python 3.10 support is dropped
     in_flight_requests: dict[str, VllmCaptionRequest] = {}
     results: dict[int, str] = {}
+    reasonings: dict[int, str | None] = {}
 
     # Map request_id -> original input index so we can return captions in input order
     request_id_to_index: dict[str, int] = {}
@@ -601,6 +619,7 @@ def _caption_inflight_batching(  # noqa: PLR0913
             if r.stage2_prompt is None:
                 original_idx = request_id_to_index[r.request_id]
                 results[original_idx] = r.caption or "Unknown caption"
+                reasonings[original_idx] = r.reasoning
 
         needs_stage2 = [r for r in finished if r.stage2_prompt is not None]
 
@@ -611,7 +630,10 @@ def _caption_inflight_batching(  # noqa: PLR0913
             # Propagate the original index to the refined request's new request_id
             request_id_to_index[refined_request.request_id] = original_idx
 
-    return [results[i] for i in range(total_requests)]
+    return (
+        [results[i] for i in range(total_requests)],
+        [reasonings.get(i) for i in range(total_requests)],
+    )
 
 
 def vllm_caption(  # noqa: PLR0913
@@ -624,7 +646,7 @@ def vllm_caption(  # noqa: PLR0913
     *,
     inflight_batching: bool,
     stage2_prompts: list[str | None] | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str | None]]:
     """Caption the videos using the vLLM model.
 
     This is the main entry point for video captioning. It handles:
@@ -650,7 +672,8 @@ def vllm_caption(  # noqa: PLR0913
            Must be the same length as model_inputs.
 
     Returns:
-        Captions for each video.
+        A tuple ``(captions, reasonings)`` aligned to the input order. ``reasonings[i]``
+        is None for non-reasoning models.
 
     Raises:
         ValueError: If max_inflight_requests is negative.

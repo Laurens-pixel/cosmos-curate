@@ -9,6 +9,7 @@ from cosmos_curate.pipelines.video.evaluation.gt_sources.inhard_online import In
 from cosmos_curate.pipelines.video.evaluation.gt_sources.manual import ManualAnnotationJsonGt
 from cosmos_curate.pipelines.video.evaluation.gt_sources.none import NoneGt
 from cosmos_curate.pipelines.video.evaluation.gt_sources.nuscenes import NuScenesGt
+from cosmos_curate.pipelines.video.evaluation.gt_sources.wgo import WgoBenchGt
 from cosmos_curate.pipelines.video.evaluation.gt_sources.youcook2 import YouCook2Gt
 
 _GT_SOURCES: dict[str, type[GtSource]] = {
@@ -18,6 +19,7 @@ _GT_SOURCES: dict[str, type[GtSource]] = {
     ManualAnnotationJsonGt.name(): ManualAnnotationJsonGt,
     NoneGt.name(): NoneGt,
     NuScenesGt.name(): NuScenesGt,
+    WgoBenchGt.name(): WgoBenchGt,
     YouCook2Gt.name(): YouCook2Gt,
 }
 
@@ -43,6 +45,7 @@ __all__ = [
     "ManualAnnotationJsonGt",
     "NoneGt",
     "NuScenesGt",
+    "WgoBenchGt",
     "YouCook2Gt",
     "get_gt_source_class",
     "list_gt_sources",

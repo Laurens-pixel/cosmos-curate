@@ -233,6 +233,11 @@ def _write_split_result_summary(  # noqa: PLR0913
             client_output=client_output,
             all_video_data=all_video_data,
         )
+        _write_all_window_reasoning(
+            output_path=output_path,
+            client_output=client_output,
+            all_video_data=all_video_data,
+        )
         _write_all_window_judgments(
             output_path=output_path,
             client_output=client_output,
@@ -444,6 +449,62 @@ def _write_all_window_captions(  # noqa: PLR0913
             backup_and_overwrite=True,
         )
         logger.info(f"Wrote all window captions to {dest}")
+
+    do_with_retries(_write)
+
+
+def _write_all_window_reasoning(
+    *,
+    output_path: str,
+    client_output: storage_client.StorageClient | None,
+    all_video_data: dict[str, ProcessedVideoMetadata] | None = None,
+    output_s3_profile_name: str | None = None,
+    input_videos_relative: list[str] | None = None,
+    limit: int | None = None,
+) -> None:
+    """Gather reasoning traces (reasoning caption models only) and write them to a JSON file.
+
+    Output schema mirrors ``all_window_captions.json`` (``video -> clip_uuid -> window_key
+    -> reasoning_string``). Only windows whose caption model produced a ``<think>`` trace
+    appear; for non-reasoning models the file is effectively empty. Kept separate from the
+    captions file so the chain-of-thought can be inspected without affecting grounding.
+    """
+    if all_video_data is None:
+        # this the hacky managed service zip upload/download path
+        assert input_videos_relative is not None
+        assert limit is not None
+        all_video_data = _read_all_video_metadata_parallel(
+            output_path,
+            output_s3_profile_name,
+            input_videos_relative,
+            limit,
+        )
+
+    all_window_reasoning_data: dict[str, Any] = {}
+    for input_video, data in all_video_data.items():
+        if data.video_metadata is None:
+            continue
+        all_window_reasoning_data[input_video] = {}
+        for clip_chunk in data.clip_chunks:
+            for clip_id, clip_data in clip_chunk.get("all_windows_reasoning", {}).items():
+                if not clip_data:
+                    continue
+                if clip_id not in all_window_reasoning_data[input_video]:
+                    all_window_reasoning_data[input_video][clip_id] = {}
+                all_window_reasoning_data[input_video][clip_id].update(clip_data)
+
+    def _write() -> None:
+        dest = get_full_path(output_path, "v0", "all_window_reasoning.json")
+        write_json(
+            all_window_reasoning_data,
+            dest,
+            "all window reasoning",
+            "all videos",
+            verbose=True,
+            client=client_output,
+            backup_and_overwrite=True,
+        )
+        logger.info(f"Wrote all window reasoning to {dest}")
 
     do_with_retries(_write)
 

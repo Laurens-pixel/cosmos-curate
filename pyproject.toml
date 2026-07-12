@@ -154,6 +154,11 @@ extend-select = ["I"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["INP001", "SLF001", "PLR2004"]
+# Class E boundary detector. Imports of torch/transformers/PIL are deliberately deferred into the
+# encoder `_load`/`encode` methods so that (a) the pure numpy algorithm core imports and unit-tests
+# without a GPU stack present, and (b) the import of `shot_boundary_models` frame helpers is not
+# circular (that module's factory imports this one).
+"cosmos_curate/pipelines/video/clipping/predictive_boundary.py" = ["PLC0415"]
 # Offline analysis CLI: prints a human report (T201) and has inherently branchy
 # aggregation helpers (C901/PLR09xx). These conventions differ from pipeline code.
 "cosmos_curate/pipelines/video/evaluation/benchmark_captions.py" = [
@@ -164,6 +169,13 @@ extend-select = ["I"]
 ]
 "cosmos_curate/pipelines/video/evaluation/benchmark_boundaries.py" = [
     "T201", "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915",
+]
+# Same class of tool as the benchmark_* CLIs above: an offline analysis script that prints a human
+# report (T201) and has inherently branchy detector/sweep logic (C901/PLR09xx). S311 is the stdlib
+# `random` used to shuffle windows for statistical sampling — reproducibility is wanted here, not
+# cryptographic randomness.
+"cosmos_curate/pipelines/video/evaluation/detect_objects.py" = [
+    "T201", "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "S311", "D301", "E501",
 ]
 
 [tool.ruff.lint.isort]

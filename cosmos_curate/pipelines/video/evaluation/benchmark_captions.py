@@ -202,6 +202,15 @@ def extract_caption_text(raw: str) -> str:
     if not raw:
         return ""
     text = raw.strip()
+    # Reasoning models (e.g. Cosmos-Reason) prefer <answer>; on malformed outputs a <think>
+    # block can leak into the stored caption. Strip it so grounding sees only the answer.
+    if "<think>" in text.lower() or "<answer>" in text.lower():
+        ans = re.search(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.DOTALL | re.IGNORECASE)
+        if ans:
+            text = ans.group(1).strip()
+        else:
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r"</?(?:think|answer)>", "", text, flags=re.IGNORECASE).strip()
     m = _FENCE_RE.search(text)
     if m:
         text = m.group(1).strip()
@@ -352,6 +361,9 @@ class WindowRec:
     judges: dict[str, dict[str, Any]] = field(default_factory=dict)  # variant -> record
     gt_action_text: str = ""
     gt_extras: dict[str, Any] = field(default_factory=dict)
+    # Objects an open-vocab detector actually found in this window's frames (from
+    # all_window_objects.json; see detect_objects.py). Empty when no detection pass was run.
+    detected_objects: list[str] = field(default_factory=list)
 
 
 def _parse_frame_range(window_key: str) -> tuple[int, int]:
@@ -492,6 +504,40 @@ def _gt_extras_for_window(abs_start: int, abs_end: int, actions: list[dict[str, 
     return overlapping[0]["action_text"], extras
 
 
+def attach_detected_objects(recs: list[WindowRec], run_dir: Path) -> int:
+    """Attach per-window detector objects from ``all_window_objects.json`` (if present).
+
+    Produced by ``detect_objects.py`` (an open-vocab detector run over the window frames).
+    Returns the number of windows that received a detection list. When the file is absent the
+    object-grounding metrics simply do not appear in the report.
+    """
+    path = run_dir / "v0" / "all_window_objects.json"
+    if not path.exists():
+        return 0
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0
+    index: dict[tuple[str, str, str], list[str]] = {}
+    for video, clips in data.items():
+        if not isinstance(clips, dict):
+            continue
+        for clip_uuid, windows in clips.items():
+            if not isinstance(windows, dict):
+                continue
+            for wk, entry in windows.items():
+                objs = entry.get("objects") if isinstance(entry, dict) else None
+                if isinstance(objs, list):
+                    index[(video, clip_uuid, wk)] = [str(o) for o in objs]
+    n = 0
+    for r in recs:
+        objs = index.get((r.source_video, r.clip_uuid, r.window_key))
+        if objs is not None:
+            r.detected_objects = objs
+            n += 1
+    return n
+
+
 def attach_gt_from_task_info(recs: list[WindowRec], run_dir: Path, task_info_dir: Path) -> int:
     """Populate each window's GT from AgiBot task_info, independent of any judgments.
 
@@ -519,6 +565,261 @@ def attach_gt_from_task_info(recs: list[WindowRec], run_dir: Path, task_info_dir
             r.gt_extras = extras
             n += 1
     return n
+
+
+# ── Metric: object grounding + hallucination (CHAIR) against a detector ─────────
+
+
+_OBJECT_VOCAB_FILE = Path(__file__).with_name("object_vocab.txt")
+_SYNONYM_MAP_CACHE: dict[str, str] | None = None
+
+
+def load_object_vocab(path: Path | None = None) -> tuple[list[str], dict[str, str]]:
+    """Parse ``object_vocab.txt`` into (surface_forms, synonym→canonical head-stem map).
+
+    Lines are ``canonical`` or ``canonical: syn1, syn2``. ``surface_forms`` is every canonical
+    and synonym string (the detector prompts with all of them). The map sends each surface
+    form's head stem to the canonical's head stem, so "trolley"/"shopping cart" → "cart" and
+    "fridge" → "refrigerator" during matching — CHAIR's synonym map, kept as data not code.
+    """
+    path = path or _OBJECT_VOCAB_FILE
+    surface: list[str] = []
+    canon: dict[str, str] = {}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line:
+            head, _, rest = line.partition(":")
+            canonical = head.strip().lower()
+            syns = [s.strip().lower() for s in rest.split(",") if s.strip()]
+        else:
+            canonical, syns = line.lower(), []
+        forms = [canonical, *syns]
+        surface.extend(forms)
+        ctoks = content_tokens(canonical)
+        canon_head = ctoks[-1] if ctoks else canonical
+        for form in forms:
+            ftoks = content_tokens(form)
+            if ftoks:
+                canon[ftoks[-1]] = canon_head
+    return sorted(set(surface)), canon
+
+
+def _synonym_map() -> dict[str, str]:
+    """Return the cached synonym->canonical head-stem map from the vocab file (empty if unreadable)."""
+    global _SYNONYM_MAP_CACHE  # noqa: PLW0603
+    if _SYNONYM_MAP_CACHE is None:
+        try:
+            _, _SYNONYM_MAP_CACHE = load_object_vocab()
+        except (OSError, ValueError):
+            _SYNONYM_MAP_CACHE = {}
+    return _SYNONYM_MAP_CACHE
+
+
+def _object_head_tokens(phrases: list[str], canon: dict[str, str]) -> set[str]:
+    """Canonical head (last content) token of each detected object phrase.
+
+    Matching on the head noun makes multi-word detections align with captions robustly
+    ("bell pepper" → ``pepper``, "robotic arm" → ``arm``); the ``canon`` synonym map then folds
+    surface variants onto one canonical ("trolley" → ``cart``) so synonyms are not miscounted.
+    """
+    heads: set[str] = set()
+    for phrase in phrases:
+        toks = content_tokens(phrase)
+        if toks:
+            heads.add(canon.get(toks[-1], toks[-1]))
+    return heads
+
+
+def wilson_ci(successes: int, n: int, z: float = 1.96) -> list[float]:
+    """95% Wilson score interval for a binomial proportion.
+
+    Used because the object pass may run on a *random sample* of windows under a wall-clock budget,
+    so CHAIR is an estimate and deserves an interval. Wilson (not normal-approximation) because it
+    stays inside [0, 1] and behaves correctly for small n and for proportions near 0 or 1 — exactly
+    the regime a truncated sample lands in.
+    """
+    if n <= 0:
+        return [0.0, 1.0]
+    p = successes / n
+    denom = 1 + z**2 / n
+    centre = (p + z**2 / (2 * n)) / denom
+    margin = z * math.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
+    return [round(max(0.0, centre - margin), 4), round(min(1.0, centre + margin), 4)]
+
+
+def object_grounding_stats(recs: list[WindowRec]) -> dict[str, Any]:
+    """Visual object grounding + hallucination, scored against an open-vocab detector.
+
+    This is the object-level replacement for crude bag-of-words lexical overlap: instead of
+    comparing caption words to the GT *action text*, it compares the objects the caption names
+    to the objects an open-vocabulary detector actually found in the frames
+    (``all_window_objects.json``). Semantic-embedding metrics smooth over object swaps (they
+    rate "cucumber" ≈ "bell pepper" as close); a detector-grounded check catches them.
+
+    The realized object vocabulary ``universe`` is every object the detector found anywhere in
+    the run — i.e. objects that genuinely occur in this dataset. A caption word is treated as an
+    *object mention* only when it is in that universe, so generic/background nouns the detector
+    never looks for do not pollute precision.
+
+    Metrics (per window with ≥1 detection, then aggregated):
+      * ``object_recall``     — mean fraction of detected objects the caption names (coverage).
+      * ``object_precision``  — fraction of caption object-mentions that are actually present
+        (= 1 - CHAIR_i; instance-summed).
+      * ``object_f1``         — harmonic mean of the two.
+      * ``chair_i``           — CHAIR instance-level hallucination rate: hallucinated object
+        mentions ÷ all object mentions (Rohrbach et al., EMNLP 2018). Lower is better.
+      * ``chair_s``           — CHAIR sentence-level rate: fraction of captions with ≥1
+        hallucinated object. Lower is better.
+
+    CHAIR (Caption Hallucination Assessment with Image Relevance) is the standard object-
+    hallucination metric for image/video captioning; here the reference object set is the
+    detector output rather than dataset annotations, so it works on any video without labels.
+    A synonym map (from the curated vocab file) folds surface variants onto one canonical, so
+    "trolley"/"cart" or "fridge"/"refrigerator" are not miscounted as hallucinations.
+    """
+    canon = _synonym_map()
+    universe: set[str] = set()
+    for r in recs:
+        universe |= _object_head_tokens(r.detected_objects, canon)
+    if not universe:
+        return {}
+
+    recall_vals: list[float] = []
+    n_windows = n_windows_with_mentions = n_windows_hallucinated = 0
+    total_mentions = total_hallucinated = 0
+    for r in recs:
+        if not r.caption or not r.detected_objects:
+            continue
+        present = _object_head_tokens(r.detected_objects, canon)
+        if not present:
+            continue
+        n_windows += 1
+        # canonicalise caption tokens the same way the detected objects were canonicalised
+        cap_tokens = {canon.get(t, t) for t in content_tokens(r.caption)}
+        # coverage of what is visually present
+        recall_vals.append(len(present & cap_tokens) / len(present))
+        # object mentions = caption words that are real objects somewhere in the run
+        mentions = cap_tokens & universe
+        if mentions:
+            n_windows_with_mentions += 1
+            hallucinated = mentions - present
+            total_mentions += len(mentions)
+            total_hallucinated += len(hallucinated)
+            if hallucinated:
+                n_windows_hallucinated += 1
+
+    if n_windows == 0:
+        return {}
+    object_recall = statistics.mean(recall_vals) if recall_vals else 0.0
+    object_precision = (1.0 - total_hallucinated / total_mentions) if total_mentions else None
+    object_f1 = (
+        2 * object_recall * object_precision / (object_recall + object_precision)
+        if (object_precision is not None and (object_recall + object_precision))
+        else None
+    )
+    chair_i = (total_hallucinated / total_mentions) if total_mentions else None
+    return {
+        "n_windows_with_detections": n_windows,
+        "n_windows_total": len(recs),
+        "object_sample_fraction": round(n_windows / len(recs), 3) if recs else None,
+        "object_universe_size": len(universe),
+        "object_recall": round(object_recall, 4),
+        "object_precision": round(object_precision, 4) if object_precision is not None else None,
+        "object_f1": round(object_f1, 4) if object_f1 is not None else None,
+        "chair_i": round(chair_i, 4) if chair_i is not None else None,
+        # CHAIR_i is a proportion over object *mentions*; the detector may have run on a random
+        # sample of windows (time-budgeted pass), so report the interval, not just the point
+        # estimate. A reader can then see immediately whether two detectors' rates really differ.
+        "chair_i_ci95": wilson_ci(total_hallucinated, total_mentions) if total_mentions else None,
+        "chair_s": round(n_windows_hallucinated / n_windows_with_mentions, 4) if n_windows_with_mentions else None,
+        "chair_s_ci95": (
+            wilson_ci(n_windows_hallucinated, n_windows_with_mentions) if n_windows_with_mentions else None
+        ),
+    }
+
+
+def fair_grounding_stats(recs: list[WindowRec], grounding: dict[str, Any]) -> dict[str, Any]:
+    """Detail-fair caption quality: COVERAGE (vs GT) x FAITHFULNESS (vs the video).
+
+    The plain ``sem_f1`` is unfair to *good detailed* captions: its precision term asks "does
+    every clause match a GT action?", and against a terse GT ("pick up the X") a correct rich
+    caption's extra clauses ("adjusts grip, lifts, holds it steady") match nothing and are scored
+    as if they were padding. A terse reference simply cannot judge whether extra detail is true.
+
+    The fix decomposes quality into the two questions and judges each against the reference that
+    can actually answer it:
+
+    * ``coverage`` — did the caption express the GT action? This is recall vs GT
+      (``sem_recall``, or lexical hit-rate if no encoder). It *rewards* completeness, so detail
+      is never penalised here.
+    * ``faithfulness`` — is what the caption says actually in the video? Judged against the
+      **video**, never the terse GT:
+        - ``judge_faithfulness``  : fraction of windows the in-pipeline VLM judges (which watch
+          the clip) rate correct, averaged over judges present.
+        - ``object_faithfulness`` : ``1 - CHAIR_i`` — fraction of named objects the detector
+          actually found in frame.
+      The primary ``faithfulness`` is the judge signal when present (a direct "is this caption
+      correct?"), else the detector signal.
+
+    Degenerate judges are excluded. A judge that returns the *same* verdict on every window
+    (e.g. VCI-7B rating an out-of-domain dataset all-incorrect, Gemma4 all-correct) has zero
+    variance and carries no information; averaging them yields a meaningless ~0.5. Such judges
+    are dropped from ``judge_faithfulness``, and if none are informative the judge signal is
+    ``None`` (faithfulness then falls back to the detector, or is reported unavailable rather
+    than fabricated). The excluded judges are listed in ``degenerate_judges`` for transparency.
+
+    * ``fair_grounding_f1`` — harmonic mean of coverage and faithfulness. A detailed *accurate*
+      caption scores high on both; a detailed *hallucinated* one is caught by faithfulness, not
+      by a length penalty. This is the headline that does not punish detail. It is ``None`` when
+      no trustworthy faithfulness signal exists — the metric never fabricates one.
+    """
+    coverage = grounding.get("sem_recall")
+    if not isinstance(coverage, (int, float)):
+        coverage = grounding.get("action_hit_rate")
+
+    # Per-judge correct flags across windows, to detect zero-variance (degenerate) judges.
+    per_judge: dict[str, list[bool]] = {}
+    for r in recs:
+        for variant, rec in r.judges.items():
+            inc = _verdict_is_incorrect(rec)
+            if inc is not None:
+                per_judge.setdefault(variant, []).append(not inc)  # True = judged correct
+    informative: list[str] = []
+    degenerate: list[str] = []
+    for variant, flags in per_judge.items():
+        n_correct = sum(flags)
+        if len(flags) >= 2 and 0 < n_correct < len(flags):  # noqa: PLR2004 — has both verdicts => informative
+            informative.append(variant)
+        elif len(flags) >= 2:  # noqa: PLR2004 — all identical => no signal
+            degenerate.append(variant)
+
+    # judge faithfulness = mean over windows of (mean "correct" across INFORMATIVE judges present)
+    judge_vals: list[float] = []
+    for r in recs:
+        flags = [not inc for v in informative if (inc := _verdict_is_incorrect(r.judges.get(v, {}))) is not None]
+        if flags:
+            judge_vals.append(sum(flags) / len(flags))
+    judge_faith = statistics.mean(judge_vals) if judge_vals else None
+
+    chair_i = grounding.get("chair_i")
+    object_faith = (1.0 - chair_i) if isinstance(chair_i, (int, float)) else None
+
+    faithfulness = judge_faith if judge_faith is not None else object_faith
+
+    out: dict[str, Any] = {
+        "coverage": round(coverage, 4) if isinstance(coverage, (int, float)) else None,
+        "judge_faithfulness": round(judge_faith, 4) if judge_faith is not None else None,
+        "object_faithfulness": round(object_faith, 4) if object_faith is not None else None,
+        "faithfulness": round(faithfulness, 4) if faithfulness is not None else None,
+        "informative_judges": informative or None,
+        "degenerate_judges": degenerate or None,
+        "n_judge_faith": len(judge_vals) or None,
+    }
+    if isinstance(coverage, (int, float)) and isinstance(faithfulness, (int, float)) and (coverage + faithfulness) > 0:
+        out["fair_grounding_f1"] = round(2 * coverage * faithfulness / (coverage + faithfulness), 4)
+    return out
 
 
 # ── Metric: descriptive caption stats ──────────────────────────────────────────
@@ -1274,22 +1575,43 @@ def cross_model_similarity(runs: dict[str, list[WindowRec]]) -> dict[str, Any]:
 def _composite_quality(report: dict[str, Any]) -> float | None:
     """Combine available quality signals into one 0-1 score (higher = better).
 
-    Components (each used only if present):
-      * semantic F1 if available, else lexical action F1 (grounding correctness);
-      * unique-caption ratio (guards against a model that wins by repeating one caption);
-      * object continuity and (1 - contradiction rate).
+    Design principle: **reward covering the action and any true detail; penalise only
+    invention.** The old composite used semantic *F1*, whose precision term subtracts credit for
+    every caption clause that does not match the ground-truth action text. On datasets whose GT
+    is a terse action label (e.g. AgiBot "pick up the eggplant"), that unfairly punishes rich,
+    accurate description — the caption is good, the GT is just impoverished. So the composite
+    uses:
 
-    Notes on what is deliberately NOT rewarded: caption *length* (the semantic F1's precision
-    term already penalises padding), and intra-clip consistency is dropped from the composite
-    because a degenerate model that repeats itself would score high on it — uniqueness is used
-    instead. Efficiency is reported separately and not folded in.
+      * ``coverage`` = semantic *recall* (best-matching clause per GT action). Rich extra detail
+        cannot lower it, because recall ignores unmatched clauses. This is the detail-friendly
+        replacement for sem_f1.
+      * ``faithfulness`` = ``1 - CHAIR_i`` when a detector pass exists — the fraction of named
+        objects that are actually present. This penalises hallucination but not true detail, and
+        it is the guard that stops ``coverage`` from being gamed by verbose *invented* text.
+        (Falls back to ``object_f1`` if CHAIR is absent.)
+      * ``unique-caption ratio`` (guards against a model that repeats one caption).
+      * object continuity and ``(1 - contradiction rate)``.
+
+    Caption length is deliberately NOT penalised — with GT this weak, longer *true* captions are
+    better for downstream use. ``sem_f1`` is still reported per run for reference, just not used
+    as the headline. The object-level faithfulness guard only covers *objects*; hallucinated
+    actions/attributes are caught by the separate VLM faithfulness metric, not here.
     """
     g = report.get("grounding", {})
     c = report.get("consistency", {})
     cap = report.get("captions", {})
-    grounding_score = g.get("sem_f1") if g.get("sem_f1") is not None else g.get("action_f1")
+    coverage = g.get("coverage")
+    if not isinstance(coverage, (int, float)):
+        coverage = g.get("sem_recall") if g.get("sem_recall") is not None else g.get("action_recall_unweighted")
+    # Video-grounded faithfulness: prefer the VLM judge signal (works with no detector, e.g. WGO),
+    # then detector CHAIR / object-F1. fair_grounding_stats already picks judge-then-object.
+    faithfulness = g.get("faithfulness")
+    if not isinstance(faithfulness, (int, float)):
+        chair = g.get("chair_i")
+        faithfulness = (1.0 - chair) if isinstance(chair, (int, float)) else g.get("object_f1")
     candidates = (
-        grounding_score,
+        coverage,
+        faithfulness,
         cap.get("unique_caption_ratio"),
         c.get("object_continuity"),
         (1.0 - c["contradiction_rate"]) if isinstance(c.get("contradiction_rate"), (int, float)) else None,
@@ -1314,6 +1636,7 @@ def build_report(
     per_run: dict[str, Any] = {}
     for name, recs in runs.items():
         grounding = grounding_stats(recs, coverage_threshold)
+        grounding.update(object_grounding_stats(recs))
         grounding.update(granularity_stats(recs))
         grounding.update(idle_stats(recs, coverage_threshold))
         grounding.update(order_stats(recs, primary_encode))
@@ -1325,6 +1648,9 @@ def build_report(
             primary_name = next(iter(sem_by_model))
             grounding.update(sem_by_model[primary_name])  # flat sem_* from primary → table/composite
             grounding["semantic_models"] = sem_by_model  # full per-model for comparison
+        # Detail-fair grounding: coverage (vs GT) x faithfulness (vs video). Computed last so it
+        # can read sem_recall + chair_i already merged above.
+        grounding.update(fair_grounding_stats(recs, grounding))
         per_run[name] = {
             "captions": caption_stats(recs),
             "judges": judge_stats(recs, manual_gt),
@@ -1361,8 +1687,13 @@ def print_summary(report: dict[str, Any]) -> None:
     """Print a compact ranking table to stdout."""
     cols: list[tuple[str, Any]] = [
         ("n_cap", lambda r: r["captions"].get("n_captions")),
+        ("COVERAGE", lambda r: r["grounding"].get("coverage") or r["grounding"].get("sem_recall")),
+        ("faithful", lambda r: r["grounding"].get("faithfulness")),  # video-grounded (judge or CHAIR)
+        ("FAIR_f1", lambda r: r["grounding"].get("fair_grounding_f1")),  # coverage x faithfulness
+        ("sem_f1(GT)", lambda r: r["grounding"].get("sem_f1")),  # GT-limited; reference only
         ("lex_f1", lambda r: r["grounding"].get("action_f1")),
-        ("sem_f1", lambda r: r["grounding"].get("sem_f1")),
+        ("obj_f1", lambda r: r["grounding"].get("object_f1")),
+        ("chair_s", lambda r: r["grounding"].get("chair_s")),
         ("sem_prec", lambda r: r["grounding"].get("sem_precision")),
         ("boundary", lambda r: r["grounding"].get("boundary_recall")),
         ("order", lambda r: r["grounding"].get("order_consistency_lexical")),
@@ -1407,6 +1738,17 @@ def print_summary(report: dict[str, Any]) -> None:
                     f"recall={_fmt(d.get('sem_recall'))} precision={_fmt(d.get('sem_precision'))} "
                     f"len_bias(f1)={_fmt((d.get('length_robustness') or {}).get('sem_f1_vs_length_r'))}"
                 )
+    # object grounding + hallucination (CHAIR), printed per run when a detector pass exists.
+    for n in report["runs"]:
+        g = report["runs"][n]["grounding"]
+        if g.get("object_f1") is not None or g.get("chair_s") is not None:
+            print(f"\nObject grounding [{n}] (vs open-vocab detector; CHAIR = hallucination, lower better):")
+            print(
+                f"  object_recall={_fmt(g.get('object_recall'))}  object_precision={_fmt(g.get('object_precision'))}  "
+                f"object_f1={_fmt(g.get('object_f1'))}  CHAIR_i={_fmt(g.get('chair_i'))}  "
+                f"CHAIR_s={_fmt(g.get('chair_s'))}  "
+                f"(n={g.get('n_windows_with_detections')}, |objects|={g.get('object_universe_size')})"
+            )
     # length-bias diagnostic: how much each grounding score correlates with caption length.
     # |r| near 0 = length-robust; high positive = a longer caption inflates the score.
     for n in report["runs"]:
@@ -1523,6 +1865,9 @@ def main() -> None:
             print(f"[loaded] {name}: {len(recs)} windows from {d} ({n_gt} with GT from task_info)")
         else:
             print(f"[loaded] {name}: {len(recs)} windows from {d}")
+        n_obj = attach_detected_objects(recs, d)
+        if n_obj:
+            print(f"[loaded] {name}: detector objects for {n_obj} windows (all_window_objects.json)")
 
     manual_gt = load_manual_gt(args.manual_gt) if args.manual_gt else None
     if manual_gt is not None:

@@ -1,0 +1,197 @@
+# Curated open-vocabulary object class list for the object-grounding / CHAIR metric.
+#
+# This is a FIXED, standard object vocabulary — like COCO-80 or LVIS in open-vocabulary
+# detection evaluation. It is deliberately independent of the captions being evaluated (using
+# caption-derived classes would be circular and would bias recall/CHAIR).
+#
+# FORMAT — one object per line:
+#     canonical
+#     canonical: synonym1, synonym2, ...
+# The canonical name and every synonym are given to the detector as class prompts (so it can
+# fire on whichever surface form it recognises), but they all COLLAPSE to the canonical for
+# matching. This is CHAIR's synonym map (Rohrbach et al. 2018): it stops "cart" vs "trolley" or
+# "fridge" vs "refrigerator" from being counted as hallucinations, while genuinely different
+# objects (cucumber vs bell pepper) stay distinct — those are the errors we want to catch.
+#
+# Group only TRUE synonyms of the same physical object. Do NOT group visually-similar-but-
+# different objects (cucumber / zucchini, onion / potato): confusing those is a real caption
+# error and must remain detectable. To evaluate a different domain, copy this file and pass
+# --vocab-file; do not edit the detector code. '#' comments and blank lines are ignored.
+
+# ── produce / vegetables ──
+cucumber
+bell pepper: red pepper, green pepper, red bell pepper, green bell pepper, capsicum
+tomato
+carrot
+potato
+onion
+garlic
+ginger
+corn: corn cob, ear of corn
+eggplant: aubergine
+broccoli
+cauliflower
+lettuce
+cabbage
+spinach
+celery
+mushroom: shiitake mushroom
+zucchini
+pumpkin
+squash
+chili pepper
+radish
+beetroot
+green bean
+pea
+
+# ── produce / fruit ──
+apple
+orange
+banana
+lemon
+lime
+pear
+peach
+plum
+grape
+strawberry
+blueberry
+kiwi
+mango
+pineapple
+watermelon
+melon
+avocado
+coconut
+
+# ── food / pantry ──
+bread
+egg
+cheese
+butter
+milk
+yogurt
+juice: juice bottle, juice carton
+rice
+pasta
+noodles
+flour
+sugar
+salt
+snack: snack bag, snack packet
+chips
+cookie
+biscuit
+candy
+chocolate
+cereal: cereal box
+sausage
+meat
+fish
+
+# ── containers / packaging ──
+bottle: water bottle, plastic bottle
+can: soda can, tin can
+jar
+carton
+box: cardboard box
+bag: plastic bag, shopping bag
+packet
+cup
+mug
+bowl
+plate
+dish
+tray
+basket
+bin: trash can, garbage can, waste bin
+bucket
+crate
+container
+canister
+
+# ── kitchen tools / utensils ──
+spoon
+fork
+knife
+spatula
+ladle
+whisk
+tongs
+chopsticks
+cutting board: chopping board
+pot
+pan
+kettle
+teapot
+colander
+strainer
+glass
+
+# ── appliances / furniture ──
+refrigerator: fridge
+freezer
+microwave
+oven
+stove
+toaster
+blender
+sink
+faucet: tap
+cabinet
+drawer
+shelf: rack
+counter: countertop
+table
+chair
+door
+cart: trolley, shopping cart, shopping trolley
+stand: display stand, fruit stand
+
+# ── household / misc ──
+towel
+cloth
+sponge
+napkin
+brush
+book
+remote control
+phone
+scissors
+pen
+marker
+tape
+
+# ── tools / industrial parts ──
+screwdriver
+wrench: spanner
+hammer
+drill
+pliers
+clamp
+screw
+bolt
+nut
+washer
+gear
+bracket
+pipe
+tube
+hose
+wire
+cable
+connector
+panel
+metal rod
+bar
+handle
+lever
+button
+switch
+component
+part
+
+# ── robot ──
+robotic arm: robot arm, mechanical arm
+gripper: robot gripper, end effector, mechanical hand, claw

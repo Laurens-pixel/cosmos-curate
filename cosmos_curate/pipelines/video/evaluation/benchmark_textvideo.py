@@ -73,8 +73,39 @@ def load_clip_meta(run_dir: Path) -> dict[str, dict[str, Any]]:
 # ── Frame decoding (PyAV) ──────────────────────────────────────────────────────
 
 
-def decode_window_frames(video_path: Path, start_s: float, end_s: float, num_frames: int) -> list[Any]:
-    """Decode ``num_frames`` PIL frames evenly across [start_s, end_s] of the source video."""
+def _resize_bounded(img: Any, shortest: int, longest: int) -> Any:  # noqa: ANN401
+    """Scale ``img`` so its shortest edge is ``shortest``, preserving aspect, capped at ``longest``."""
+    w, h = img.size
+    if not w or not h:
+        return img
+    scale = shortest / min(w, h)
+    if max(w, h) * scale > longest:
+        scale = longest / max(w, h)
+    from PIL import Image  # noqa: PLC0415
+
+    return img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.BILINEAR)
+
+
+def decode_window_frames(
+    video_path: Path,
+    start_s: float,
+    end_s: float,
+    num_frames: int,
+    frame_size: int | None = _FRAME_SIZE,
+    bounded: tuple[int, int] | None = None,
+) -> list[Any]:
+    """Decode ``num_frames`` PIL frames evenly across [start_s, end_s] of the source video.
+
+    Two resize modes:
+
+    * ``frame_size`` (default) squares each frame to that edge length — matches SigLIP2's 384x384
+      input, and is what the text-video benchmark wants.
+    * ``bounded=(shortest, longest)`` scales to that shortest edge **preserving aspect ratio**, and
+      is what an object detector wants. Squaring distorts geometry; leaving frames at native
+      resolution is worse still, because WGO mixes 320x180 clips with 2560x1440 ones and a detector
+      batch pads every image up to the largest in it — one 3.7 MP frame then inflates the whole
+      batch and OOMs the GPU. Bounding here keeps batches uniform, small, and undistorted.
+    """
     import av  # noqa: PLC0415 — heavy optional dep
     from PIL import Image  # noqa: PLC0415
 
@@ -85,6 +116,16 @@ def decode_window_frames(video_path: Path, start_s: float, end_s: float, num_fra
     container = av.open(str(video_path))
     stream = container.streams.video[0]
     stream.thread_type = "AUTO"
+    # Seek to the keyframe just before start_s instead of decoding the whole prefix from
+    # frame 0 on every call. Without this, a window late in a long video decodes the entire
+    # video up to it — the dominant cost when scoring 15k+ windows. Frames that land before
+    # the first target are still skipped by the `t >= targets[ti]` test below, so the seek
+    # only changes throughput, not the selected frames.
+    if start_s > 0 and stream.time_base:
+        try:
+            container.seek(int(start_s / stream.time_base), stream=stream, backward=True, any_frame=False)
+        except (av.FFmpegError, ValueError):
+            pass
     frames: list[Any] = []
     ti = 0
     for frame in container.decode(stream):
@@ -92,7 +133,11 @@ def decode_window_frames(video_path: Path, start_s: float, end_s: float, num_fra
             break
         t = float(frame.pts * stream.time_base) if frame.pts is not None else 0.0
         if t >= targets[ti]:
-            img = frame.to_image().resize((_FRAME_SIZE, _FRAME_SIZE), Image.BILINEAR)
+            img = frame.to_image()
+            if bounded is not None:
+                img = _resize_bounded(img, bounded[0], bounded[1])
+            elif frame_size is not None:
+                img = img.resize((frame_size, frame_size), Image.BILINEAR)
             frames.append(img)
             ti += 1
     container.close()
@@ -210,7 +255,10 @@ def score_run(
     keep: list[WindowRec] = []
     frame_batches: list[list[Any]] = []
 
-    for r in recs:
+    total = len(recs)
+    for idx, r in enumerate(recs):
+        if idx % 1000 == 0:
+            print(f"[textvideo] decoding window {idx}/{total} (kept={len(keep)}, skipped={n_skipped})", flush=True)
         if not r.caption:
             continue
         meta = metas.get(r.clip_uuid)
@@ -239,6 +287,7 @@ def score_run(
         return {"n_scored": 0, "n_skipped": n_skipped}
 
     # Embed in chunks to avoid OOM on large runs (15k+ windows).
+    print(f"[textvideo] decode done: {len(keep)} windows kept, {n_skipped} skipped; embedding…", flush=True)
     vid = encoder.encode_images_batched(frame_batches)
     cap = encoder.encode_texts(cap_texts)
     gt_mask = [bool(t.strip()) for t in gt_texts]

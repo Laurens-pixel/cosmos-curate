@@ -367,6 +367,16 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                         tpivot_grid_size=args.tpivot_grid_size,
                         tpivot_iterations=args.tpivot_iterations,
                         vlm_max_new_tokens=args.shot_boundary_vlm_max_new_tokens,
+                        macrodata_sample_interval_sec=args.macrodata_sample_interval_sec,
+                        macrodata_tile_size_px=args.macrodata_tile_size_px,
+                        macrodata_sheet_columns=args.macrodata_sheet_columns,
+                        macrodata_sheet_rows=args.macrodata_sheet_rows,
+                        macrodata_duration_prior_min_sec=args.macrodata_duration_prior_min_sec,
+                        macrodata_duration_prior_max_sec=args.macrodata_duration_prior_max_sec,
+                        macrodata_vlm_max_new_tokens=args.macrodata_vlm_max_new_tokens,
+                        predictive_sample_fps=args.predictive_sample_fps,
+                        predictive_z_threshold=args.predictive_z_threshold,
+                        predictive_min_segment_s=args.predictive_min_segment_s,
                     )
                 )
             )
@@ -569,6 +579,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             frequency_penalty=args.vllm_sampling_frequency_penalty,
             min_p=args.vllm_sampling_min_p,
             max_tokens=max_tokens,
+            num_candidates=args.captioning_num_candidates,
         )
 
         vllm_config = VllmConfig(
@@ -736,6 +747,11 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 msg = "--judge-gt-labels-dir is required when --judge-gt-source=inhard_online."
                 raise ValueError(msg)
             gt_source_kwargs["labels_dir"] = args.judge_gt_labels_dir
+        elif args.judge_gt_source == "wgo":
+            if not args.judge_gt_manifest_path:
+                msg = "--judge-gt-manifest-path is required when --judge-gt-source=wgo."
+                raise ValueError(msg)
+            gt_source_kwargs["manifest_path"] = args.judge_gt_manifest_path
 
         for _variant in _active_judge_variants:
             builder.add_phase(
@@ -1025,16 +1041,78 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
             "semantic_clip",
             "semantic_siglip2",
             "semantic_dinov2",
+            "semantic_dinov2_giant",
+            "semantic_dinov3",
             "semantic_vjepa2",
             "tpivot_glm4v",
             "tpivot_internvl3",
             "tpivot_qwen3",
             "tpivot_molmo2",
+            "macrodata_glm4v",
+            "macrodata_glm46v",
+            "macrodata_internvl3",
+            "macrodata_qwen3",
+            "macrodata_molmo2",
+            "predictive_vjepa2",
+            "predictive_vjepa2_huge",
+            "predictive_vjepa2_giant",
+            "predictive_vjepa2_native_predictor",
+            "predictive_vjepa2_ac_native_predictor",
+            "predictive_vjepa2_joint_horizon",
+            "predictive_vjepa2_mc_uncertainty",
+            "predictive_vjepa2_multiscale_error",
+            "predictive_vjepa2_adaptive_stats",
+            "predictive_vjepa2_adaptive_multiscale",
+            "predictive_dinov3",
+            "predictive_fusion",
+            "fusion_arc_predictive",
         ],
         help=(
             "Boundary detector when --splitting-algorithm=shot-boundary. "
             "Class A: transnetv2, pyscenedetect. "
-            "Class B: semantic_*. Class C: tpivot_*."
+            "Class B: semantic_*. Class C: tpivot_*. Class D: macrodata_*. "
+            "Class E: predictive_* (event boundaries from V-JEPA 2 world-model prediction error; "
+            "deterministic and ~100x cheaper than the VLM detectors). "
+            "Class E variants: native/ac_native (VJEPA2-AC), joint_horizon, mc_uncertainty, "
+            "multiscale_error, adaptive_stats, adaptive_multiscale."
+        ),
+    )
+    parser.add_argument(
+        "--macrodata-vlm-max-new-tokens",
+        type=int,
+        default=12288,
+        dest="macrodata_vlm_max_new_tokens",
+        help=(
+            "Token budget for the macrodata segmenter's answer. A reasoning VLM (GLM-4.1V-Thinking) "
+            "spends thousands of tokens in <think> before the JSON segment list; too small a budget "
+            "truncates it mid-thought and it never emits any segments."
+        ),
+    )
+    parser.add_argument(
+        "--predictive-z-threshold",
+        type=float,
+        default=2.0,
+        dest="predictive_z_threshold",
+        help=(
+            "Class E: boundary fires when predictive surprise exceeds this many robust (median/MAD) "
+            "sigmas. Scale-free, so it transfers across videos; lower = more boundaries."
+        ),
+    )
+    parser.add_argument(
+        "--predictive-min-segment-s",
+        type=float,
+        default=1.0,
+        dest="predictive_min_segment_s",
+        help="Class E: minimum spacing between detected boundaries, in seconds.",
+    )
+    parser.add_argument(
+        "--predictive-sample-fps",
+        type=float,
+        default=8.0,
+        dest="predictive_sample_fps",
+        help=(
+            "Class E: frame sampling rate. Two frames form one V-JEPA 2 tubelet, so a latent spans "
+            "2/fps seconds; this sets the detector's temporal resolution."
         ),
     )
     parser.add_argument(
@@ -1064,8 +1142,46 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     parser.add_argument(
         "--shot-boundary-vlm-max-new-tokens",
         type=int,
-        default=256,
-        help="Max generation tokens for tpivot_* backends.",
+        default=2048,
+        help="Max generation tokens for tpivot_* and macrodata_* backends. Needs to be large "
+        "enough for reasoning VLMs (e.g. GLM-4.1V-Thinking) to finish <think> AND emit the JSON "
+        "answer; 256 truncated them mid-thought, yielding zero boundaries.",
+    )
+    parser.add_argument(
+        "--macrodata-sample-interval-sec",
+        type=float,
+        default=0.5,
+        help="Frame sampling interval (seconds) for macrodata_* backends.",
+    )
+    parser.add_argument(
+        "--macrodata-tile-size-px",
+        type=int,
+        default=224,
+        help="Tile size (pixels) for macrodata_* contact sheets.",
+    )
+    parser.add_argument(
+        "--macrodata-sheet-columns",
+        type=int,
+        default=5,
+        help="Contact sheet columns for macrodata_* backends.",
+    )
+    parser.add_argument(
+        "--macrodata-sheet-rows",
+        type=int,
+        default=4,
+        help="Contact sheet rows for macrodata_* backends.",
+    )
+    parser.add_argument(
+        "--macrodata-duration-prior-min-sec",
+        type=float,
+        default=2.0,
+        help="Minimum expected segment duration (seconds) in macrodata_* prompt.",
+    )
+    parser.add_argument(
+        "--macrodata-duration-prior-max-sec",
+        type=float,
+        default=10.0,
+        help="Maximum expected segment duration (seconds) in macrodata_* prompt.",
     )
     parser.add_argument(
         "--fixed-stride-split-duration",
@@ -1518,6 +1634,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
             "av-multiview",
             "av-surveillance",
             "agibot",
+            "robot_reason",
             "inhard",
             "youcook2",
         ],
@@ -1758,7 +1875,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     parser.add_argument(
         "--enhance-captions-max-output-tokens",
         type=int,
-        default=2048,
+        default=1024,
         help="Max number of output tokens requested from the enhance captions model.",
     )
     parser.add_argument(
@@ -1823,6 +1940,13 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     )
     # vLLM sampling parameters - get defaults from VllmSamplingConfig
     sampling_defaults = _get_vllm_sampling_defaults()
+    parser.add_argument(
+        "--captioning-num-candidates",
+        type=int,
+        default=sampling_defaults["num_candidates"],
+        help="Self-consistency decoding: sample this many reasoning paths per window "
+        "(video prefill is shared) and keep the majority-consistent answer. 1 disables.",
+    )
     parser.add_argument(
         "--vllm-sampling-temperature",
         type=float,
@@ -1954,7 +2078,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         "--judge-gt-source",
         type=str,
         default="agibot",
-        help="GT source plugin name (agibot | manual | youcook2 | nuscenes | inhard_online | none).",
+        help="GT source plugin name (agibot | manual | youcook2 | nuscenes | inhard_online | wgo | none).",
     )
     parser.add_argument(
         "--judge-gt-task-info-dir",
@@ -1985,6 +2109,12 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         type=str,
         default=None,
         help="For --judge-gt-source=inhard_online: directory containing .anvil annotation files.",
+    )
+    parser.add_argument(
+        "--judge-gt-manifest-path",
+        type=str,
+        default=None,
+        help="For --judge-gt-source=wgo: path to WGO-Bench episode_manifest.json.",
     )
     # ── GT-window captioning ────────────────────────────────────────────────
     parser.add_argument(

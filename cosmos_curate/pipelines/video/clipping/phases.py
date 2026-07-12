@@ -152,11 +152,31 @@ class ShotBoundarySplitConfig:
         "semantic_clip",
         "semantic_siglip2",
         "semantic_dinov2",
+        "semantic_dinov2_giant",
+        "semantic_dinov3",
         "semantic_vjepa2",
         "tpivot_glm4v",
         "tpivot_internvl3",
         "tpivot_qwen3",
         "tpivot_molmo2",
+        "macrodata_glm4v",
+        "macrodata_glm46v",
+        "macrodata_internvl3",
+        "macrodata_qwen3",
+        "macrodata_molmo2",
+        "predictive_vjepa2",
+        "predictive_vjepa2_huge",
+        "predictive_vjepa2_giant",
+        "predictive_vjepa2_native_predictor",
+        "predictive_vjepa2_ac_native_predictor",
+        "predictive_vjepa2_joint_horizon",
+        "predictive_vjepa2_mc_uncertainty",
+        "predictive_vjepa2_multiscale_error",
+        "predictive_vjepa2_adaptive_stats",
+        "predictive_vjepa2_adaptive_multiscale",
+        "predictive_dinov3",
+        "predictive_fusion",
+        "fusion_arc_predictive",
     ] = "pyscenedetect"
     # Shared clip filtering / shaping
     min_length_s: float = 2.0
@@ -176,7 +196,32 @@ class ShotBoundarySplitConfig:
     alpha: float = 0.4
     tpivot_grid_size: int = 5
     tpivot_iterations: int = 4
-    vlm_max_new_tokens: int = 256
+    # Reasoning VLMs (e.g. GLM-4.1V-Thinking) need generous budget for <think> + JSON output;
+    # 256 truncates mid-thought before any JSON is ever emitted (see shot_boundary_models.DetectorConfig).
+    vlm_max_new_tokens: int = 2048
+    macrodata_sample_interval_sec: float = 0.5
+    macrodata_tile_size_px: int = 224
+    macrodata_sheet_columns: int = 5
+    macrodata_sheet_rows: int = 4
+    # 2-10s biased the VLM toward collapsing multi-step episodes into a single segment;
+    # 1-6s matches typical subtask length (see shot_boundary_models.DetectorConfig).
+    macrodata_duration_prior_min_sec: float = 1.0
+    macrodata_duration_prior_max_sec: float = 6.0
+    # Macrodata emits a full segments list, not one small object like tpivot, so it needs its
+    # own larger budget on top of vlm_max_new_tokens.
+    macrodata_vlm_max_new_tokens: int = 12288
+    # Predictive (Class E) controls; see predictive_boundary.PredictiveBoundaryConfig.
+    predictive_sample_fps: float = 8.0
+    predictive_clip_frames: int = 32
+    predictive_clip_stride: int = 16
+    predictive_horizons: tuple[int, ...] = (1, 2, 4)
+    predictive_history: int = 4
+    predictive_z_threshold: float = 2.0
+    predictive_min_segment_s: float = 1.0
+    # ARC fusion (Class F) controls; see arc_fusion_boundary.ArcFusionBoundaryDetector.
+    arc_model_dir: str = "/config/models/TencentARC/ARC-Hunyuan-Video-7B"
+    arc_max_new_tokens: int = 1024
+    fusion_nms_tolerance_s: float = 4.0
 
 
 class ShotBoundarySplitPhase(CurationPhase):
@@ -221,11 +266,30 @@ class ShotBoundarySplitPhase(CurationPhase):
             "semantic_clip",
             "semantic_siglip2",
             "semantic_dinov2",
+            "semantic_dinov2_giant",
+            "semantic_dinov3",
             "semantic_vjepa2",
             "tpivot_glm4v",
             "tpivot_internvl3",
             "tpivot_qwen3",
             "tpivot_molmo2",
+            "macrodata_glm4v",
+            "macrodata_glm46v",
+            "macrodata_internvl3",
+            "macrodata_qwen3",
+            "macrodata_molmo2",
+            "predictive_vjepa2",
+            "predictive_vjepa2_huge",
+            "predictive_vjepa2_giant",
+            "predictive_vjepa2_native_predictor",
+            "predictive_vjepa2_ac_native_predictor",
+            "predictive_vjepa2_joint_horizon",
+            "predictive_vjepa2_mc_uncertainty",
+            "predictive_vjepa2_multiscale_error",
+            "predictive_vjepa2_adaptive_stats",
+            "predictive_vjepa2_adaptive_multiscale",
+            "predictive_dinov3",
+            "predictive_fusion",
         }:
             detector_cfg = DetectorConfig(
                 sample_fps=cfg.sample_fps,
@@ -235,6 +299,23 @@ class ShotBoundarySplitPhase(CurationPhase):
                 vlm_max_new_tokens=cfg.vlm_max_new_tokens,
                 pyscenedetect_threshold=cfg.pyscenedetect_threshold,
                 pyscenedetect_min_scene_len_frames=cfg.pyscenedetect_min_scene_len_frames,
+                macrodata_sample_interval_sec=cfg.macrodata_sample_interval_sec,
+                macrodata_tile_size_px=cfg.macrodata_tile_size_px,
+                macrodata_sheet_columns=cfg.macrodata_sheet_columns,
+                macrodata_sheet_rows=cfg.macrodata_sheet_rows,
+                macrodata_duration_prior_min_sec=cfg.macrodata_duration_prior_min_sec,
+                macrodata_duration_prior_max_sec=cfg.macrodata_duration_prior_max_sec,
+                macrodata_vlm_max_new_tokens=cfg.macrodata_vlm_max_new_tokens,
+                predictive_sample_fps=cfg.predictive_sample_fps,
+                predictive_clip_frames=cfg.predictive_clip_frames,
+                predictive_clip_stride=cfg.predictive_clip_stride,
+                predictive_horizons=cfg.predictive_horizons,
+                predictive_history=cfg.predictive_history,
+                predictive_z_threshold=cfg.predictive_z_threshold,
+                predictive_min_segment_s=cfg.predictive_min_segment_s,
+                arc_model_dir=cfg.arc_model_dir,
+                arc_max_new_tokens=cfg.arc_max_new_tokens,
+                fusion_nms_tolerance_s=cfg.fusion_nms_tolerance_s,
             )
             return [
                 CuratorStageSpec(

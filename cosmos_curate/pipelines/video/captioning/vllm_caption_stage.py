@@ -143,6 +143,21 @@ def _scatter_captions(
             logger.info(f"Caption for clip {clip_uuid}: {caption}")
 
 
+def _scatter_reasoning(windows: list[Window], reasonings: list[str | None], model_variant: str) -> None:
+    """Scatter reasoning traces back to the windows (reasoning models only).
+
+    Args:
+        windows: The windows to scatter the reasoning to.
+        reasonings: The reasoning traces, aligned with ``windows``. Entries are None for
+            models that do not emit a separate reasoning trace, in which case nothing is stored.
+        model_variant: The variant of the model.
+
+    """
+    for window, reasoning in zip(windows, reasonings, strict=True):
+        if reasoning:
+            window.reasoning[model_variant] = reasoning
+
+
 def _free_vllm_inputs(windows: list[Window], model_variant: str, *, keep_mp4: bool = False) -> None:
     """Free unused memory for the model variant.
 
@@ -686,10 +701,12 @@ class VllmCaptionStage(CuratorStage):
         self._timer.reinit(self, major_size)
 
         @tenacity.retry(stop=tenacity.stop_after_attempt(self._vllm_config.max_retries), reraise=True)
-        def _vllm_caption(model_inputs: list[dict[str, Any]], stage2_prompts: list[str | None]) -> list[str]:
+        def _vllm_caption(
+            model_inputs: list[dict[str, Any]], stage2_prompts: list[str | None]
+        ) -> tuple[list[str], list[str | None]]:
             try:
                 assert self._processor is not None
-                captions = vllm_caption(
+                caption_result = vllm_caption(
                     model_inputs,
                     self._llm,
                     self._processor,
@@ -715,7 +732,7 @@ class VllmCaptionStage(CuratorStage):
                     video = get_video_from_task(task)
                     video.errors.pop("captioning", None)
 
-                return captions
+                return caption_result
 
         _caption_stage_start = time.time()
         with self._timer.time_process():            
@@ -734,15 +751,19 @@ class VllmCaptionStage(CuratorStage):
             # Set up stage 2 prompts if enabled
             stage2_prompts = _get_stage2_prompts(self._vllm_config, len(active_windows))
 
-            # Generate captions
+            # Generate captions (and reasoning traces for reasoning models)
             try:
-                captions = _vllm_caption(model_inputs, stage2_prompts) if active_windows else [] #start here
+                captions, reasonings = (
+                    _vllm_caption(model_inputs, stage2_prompts) if active_windows else ([], [])
+                )
             except Exception:  # noqa: BLE001
                 logger.error(f"All {self._vllm_config.max_retries} retry attempts exhausted, returning empty captions")
                 captions = [""] * len(model_inputs)
+                reasonings = [None] * len(model_inputs)
 
             # Scatter captions back to windows
             _scatter_captions(active_windows, captions, active_clip_uuids, variant, verbose=self._verbose)
+            _scatter_reasoning(active_windows, reasonings, variant)
 
             logger.info(f"Generated {len(captions)} captions for {len(tasks)} tasks")
 

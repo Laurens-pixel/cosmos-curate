@@ -14,8 +14,10 @@
 # limitations under the License.
 """vLLM plugin for Cosmos-Reason1 vision-language model."""
 
+import json
 import re
 import secrets
+from collections import Counter
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -50,12 +52,75 @@ _DEFAULT_REFINE_PROMPT = (
 def _extract_from_reasoning_format(text: str) -> str:
     """Extract the <answer>...</answer> content if present.
 
-    Falls back to the original text if the reasoning format is missing.
+    Falls back to the original text if the reasoning format is missing — but always strips any
+    ``<think>...</think>`` block first, so a malformed output (reasoning but no <answer> tag)
+    never leaves chain-of-thought inside the caption used for grounding.
     """
     match = re.search(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).strip()
-    return text
+    # No <answer> tag: drop any <think> block (closed or dangling) so the caption stays clean.
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"</?(?:think|answer)>", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _extract_reasoning(text: str) -> str | None:
+    """Extract the <think>...</think> chain-of-thought, if present.
+
+    Returns None when the model emitted no explicit reasoning block, so callers can tell
+    "no reasoning" apart from "empty reasoning".
+    """
+    match = re.search(r"<think>\s*(.*?)\s*</think>", text, flags=re.DOTALL | re.IGNORECASE)
+    if match:
+        reasoning = match.group(1).strip()
+        return reasoning or None
+    return None
+
+
+def _parse_answer_fields(text: str) -> dict[str, Any] | None:
+    """Parse the structured JSON object out of a completion's answer, if there is one.
+
+    Tolerates ```json fences and surrounding prose. Returns None when the answer is plain
+    text — callers must treat that as "no structured fields", not an error, so prompts that
+    do not request JSON keep working unchanged.
+    """
+    answer = _extract_from_reasoning_format(text)
+    match = re.search(r"\{.*\}", answer, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        obj = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _select_output_index(vllm_output: RequestOutput) -> int:
+    """Pick the completion whose answer agrees with the majority (self-consistency).
+
+    With ``SamplingParams(n=K)`` each request carries K independently sampled reasoning
+    paths. Each path's *own* structured answer is parsed and its ``object`` field — what the
+    model itself claims is being manipulated — is the vote. The completion returned is the
+    first member of the majority cluster, which makes selection deterministic. This is
+    self-consistency decoding (Wang et al., ICLR 2023) keyed on the model's output schema,
+    not on any fixed vocabulary, so it transfers to any domain and any prompt that emits an
+    ``object`` field. Fallbacks: a single completion, or no parseable votes, select index 0
+    (identical to the previous single-sample behaviour).
+    """
+    outputs = vllm_output.outputs
+    if len(outputs) <= 1:
+        return 0
+    votes: list[str | None] = []
+    for out in outputs:
+        fields = _parse_answer_fields(out.text)
+        obj = fields.get("object") if fields else None
+        votes.append(obj.strip().lower() if isinstance(obj, str) and obj.strip() else None)
+    counted = Counter(v for v in votes if v is not None)
+    if not counted:
+        return 0
+    winner, _count = counted.most_common(1)[0]
+    return votes.index(winner)
 
 
 def make_message(text_input: str) -> list[dict[str, Any]]:
@@ -68,8 +133,20 @@ def make_message(text_input: str) -> list[dict[str, Any]]:
         {
             "role": "system",
             "content": (
-                "You are a helpful assistant. Answer the question in the following format: "
-                "<think>\nyour reasoning\n</think>\n\n<answer>\nyour answer\n</answer>."
+                "You are an expert analyst of robotic-manipulation videos. "
+                "Answer in exactly this format:\n"
+                "<think>\n"
+                "Reason step by step before answering:\n"
+                "1. Object: identify the object being manipulated from its visible physical "
+                "features — shape, colour, size, texture, and any markings. Do not settle for a "
+                "generic or default guess; when two objects could look alike, use the "
+                "distinguishing features to decide which it is, or state what you cannot "
+                "determine.\n"
+                "2. Action: identify the precise action and its phase (approach, reach, grasp, "
+                "lift, move, place, release, or idle).\n"
+                "3. Context: note the spatial relationship and the visible outcome.\n"
+                "</think>\n\n"
+                "<answer>\nyour answer\n</answer>."
             ),
         },
         {
@@ -228,5 +305,12 @@ class VllmCosmosReason1VL(VllmPlugin):
 
     @staticmethod
     def decode(vllm_output: RequestOutput) -> str:
-        """Decode vLLM output into a caption (extract <answer> section)."""
-        return _extract_from_reasoning_format(vllm_output.outputs[0].text)
+        """Decode vLLM output into a caption (extract <answer> of the majority-vote winner)."""
+        idx = _select_output_index(vllm_output)
+        return _extract_from_reasoning_format(vllm_output.outputs[idx].text)
+
+    @staticmethod
+    def decode_reasoning(vllm_output: RequestOutput) -> str | None:
+        """Decode the <think> chain-of-thought of the same completion ``decode`` selected."""
+        idx = _select_output_index(vllm_output)
+        return _extract_reasoning(vllm_output.outputs[idx].text)

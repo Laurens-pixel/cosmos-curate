@@ -26,6 +26,7 @@ from cosmos_curate.core.utils.config.operation_context import make_pipeline_name
 from cosmos_curate.core.utils.infra.performance_utils import StageTimer
 from cosmos_curate.pipelines.video.clipping.shot_boundary_models import (
     DetectorConfig,
+    MacrodataSegment,
     build_boundary_detector,
 )
 from cosmos_curate.pipelines.video.clipping.transnetv2_extraction_stages import _get_filtered_scenes
@@ -135,11 +136,27 @@ class ModelBoundaryClipExtractionStage(CuratorStage):
                 with video_path.open("wb") as fp:
                     fp.write(data)
                 boundary_ts = detector.detect_boundaries(str(video_path))
-                raw_scenes = self._boundary_ts_to_scene_spans(
-                    boundary_ts,
-                    total_frames=video.metadata.num_frames or 0,
-                    fps=video.metadata.framerate,
-                )
+                macrodata_segments: list[MacrodataSegment] | None = None
+                if hasattr(detector, "last_segments"):
+                    segs = getattr(detector, "last_segments", None)
+                    if segs:
+                        macrodata_segments = list(segs)
+
+                if macrodata_segments:
+                    scene_spans = [
+                        (
+                            int(seg.start_sec * video.metadata.framerate),
+                            int(seg.end_sec * video.metadata.framerate),
+                        )
+                        for seg in macrodata_segments
+                    ]
+                    raw_scenes = np.array(scene_spans, dtype=np.int32).reshape(-1, 2)
+                else:
+                    raw_scenes = self._boundary_ts_to_scene_spans(
+                        boundary_ts,
+                        total_frames=video.metadata.num_frames or 0,
+                        fps=video.metadata.framerate,
+                    )
                 filtered_scenes = _get_filtered_scenes(
                     raw_scenes,
                     min_length=self._get_min_length(video.metadata.framerate),
@@ -165,14 +182,18 @@ class ModelBoundaryClipExtractionStage(CuratorStage):
                     )
                 s3_file = video.input_video
                 for start_event, end_event in filtered_scenes:
+                    start_s = float(start_event) / video.metadata.framerate
+                    end_s = float(end_event) / video.metadata.framerate
                     clip = Clip(
                         uuid=uuid.uuid5(uuid.NAMESPACE_URL, f"{s3_file}_{start_event}_{end_event}"),
                         source_video=str(s3_file),
-                        span=(
-                            float(start_event) / video.metadata.framerate,
-                            float(end_event) / video.metadata.framerate,
-                        ),
+                        span=(start_s, end_s),
                     )
+                    if macrodata_segments:
+                        for seg in macrodata_segments:
+                            if start_s >= seg.start_sec - 0.05 and end_s <= seg.end_sec + 0.05:
+                                clip.subtask_label = seg.subtask
+                                break
                     video.clips.append(clip)
                     if self._limit_clips > 0 and len(video.clips) >= self._limit_clips:
                         break

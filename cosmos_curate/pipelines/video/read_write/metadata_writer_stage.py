@@ -754,6 +754,8 @@ class ClipWriterStage(CuratorStage):
             data["qwen_type_classification"] = clip.qwen_type_classification
         if clip.qwen_rejection_stage is not None:
             data["qwen_rejection_stage"] = clip.qwen_rejection_stage
+        if clip.subtask_label is not None:
+            data["subtask_label"] = clip.subtask_label
         if len(clip.errors) > 0:
             data["errors"] = list(clip.errors)
         has_caption = False
@@ -894,12 +896,14 @@ class ClipWriterStage(CuratorStage):
             "filtered_clips": [str(clip.uuid) for clip in video.filtered_clips],
             "all_windows": {},
             "all_windows_enhanced_caption": {},
+            "all_windows_reasoning": {},
             "all_windows_judge": {},
         }
         for clip in video.clips:
             clip_uuid = str(clip.uuid)
             data["all_windows"][clip_uuid] = {}
             data["all_windows_enhanced_caption"][clip_uuid] = {}
+            data["all_windows_reasoning"][clip_uuid] = {}
             data["all_windows_judge"][clip_uuid] = {}
             for window in clip.windows:
                 window_key = f"{window.start_frame}_{window.end_frame}"
@@ -907,6 +911,11 @@ class ClipWriterStage(CuratorStage):
                 for model in self._caption_models:
                     if model in window.caption:
                         data["all_windows"][clip_uuid][window_key] = window.caption[model]
+                        break
+                # Reasoning trace (reasoning models only) — keyed by the same caption model.
+                for model in self._caption_models:
+                    if model in window.reasoning:
+                        data["all_windows_reasoning"][clip_uuid][window_key] = window.reasoning[model]
                         break
                 # Try each enhanced caption model in order, using the first one found.
                 for model in self._enhanced_caption_models:

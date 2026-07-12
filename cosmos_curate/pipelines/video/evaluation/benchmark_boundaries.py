@@ -34,6 +34,7 @@ runs anywhere, no GPU.
 """
 
 import argparse
+import csv
 import json
 import math
 import re
@@ -111,6 +112,49 @@ def load_gt_segments_agibot(task_info_dir: Path, fps_lookup: dict[str, float]) -
         f = fps or 30.0
         out[video_name] = [(s / f, e / f) for s, e in frame_segs if e > s]
     return out
+
+
+def load_gt_segments_wgo(manifest_path: Path, fps_lookup: dict[str, float]) -> dict[str, list[Segment]]:
+    """Build ``{video_name: [(start_s, end_s), ...]}`` from WGO-Bench episode_manifest.json."""
+    del fps_lookup  # segments are already in seconds
+    records = json.loads(Path(manifest_path).read_text())
+    out: dict[str, list[Segment]] = {}
+    for rec in records:
+        name = str(rec.get("video_filename") or f"{rec['id']}.mp4")
+        segs = [
+            (float(s["start_sec"]), float(s["end_sec"]))
+            for s in (rec.get("segments") or [])
+            if float(s.get("end_sec", 0)) > float(s.get("start_sec", 0))
+        ]
+        if segs:
+            out[name] = sorted(segs)
+    return out
+
+
+def load_gt_segments_inhard(csv_path: Path, fps_lookup: dict[str, float]) -> dict[str, list[Segment]]:
+    """Build ``{video_name: [(start_s, end_s), ...]}`` from the InHARD Online action CSV.
+
+    InHARD.csv has one row per labelled action with ``File`` (e.g. ``P01_R01``) and real
+    timestamps ``Action_start_rgb_sec`` / ``Action_end_rgb_sec``. Video name is ``{File}.mp4``.
+    Unlike AgiBot these are real wall-clock seconds, so no fps conversion is needed; the
+    ``fps_lookup`` argument is accepted only to mirror the AgiBot signature.
+    """
+    del fps_lookup  # timestamps are already in seconds
+    by_file: dict[str, list[Segment]] = {}
+    with Path(csv_path).open(newline="") as fh:
+        for row in csv.DictReader(fh):
+            file_id = str(row.get("File", "")).strip()
+            try:
+                start_s = float(row["Action_start_rgb_sec"])
+                end_s = float(row["Action_end_rgb_sec"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if not file_id or end_s <= start_s:
+                continue
+            by_file.setdefault(f"{file_id}.mp4", []).append((start_s, end_s))
+    for segs in by_file.values():
+        segs.sort()
+    return by_file
 
 
 # ── Geometry helpers ────────────────────────────────────────────────────────────
@@ -300,12 +344,21 @@ def main() -> None:
     """Parse args, evaluate each detector run against GT, print + write the report."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", action="append", required=True, metavar="NAME=DIR", help="Detector output dir(s).")
-    ap.add_argument("--gt-source", choices=["agibot"], default="agibot", help="GT segment source.")
-    ap.add_argument("--gt-task-info", type=Path, required=True, help="AgiBot task_info dir (task_*.json).")
+    ap.add_argument("--gt-source", choices=["agibot", "inhard", "wgo"], default="agibot", help="GT segment source.")
+    ap.add_argument("--gt-task-info", type=Path, default=None, help="AgiBot task_info dir (task_*.json).")
+    ap.add_argument("--gt-inhard-csv", type=Path, default=None, help="InHARD Online action CSV (InHARD.csv).")
+    ap.add_argument("--gt-manifest", type=Path, default=None, help="WGO-Bench episode_manifest.json.")
     ap.add_argument("--tolerances", type=float, nargs="+", default=[0.5, 1.0], help="Boundary match tolerances (s).")
     ap.add_argument("--iou-thresholds", type=float, nargs="+", default=[0.1, 0.25, 0.5], help="Segment IoU thresholds.")
     ap.add_argument("--out", type=Path, default=None, help="Write the full JSON report here.")
     args = ap.parse_args()
+
+    if args.gt_source == "agibot" and not args.gt_task_info:
+        ap.error("--gt-source agibot requires --gt-task-info")
+    if args.gt_source == "inhard" and not args.gt_inhard_csv:
+        ap.error("--gt-source inhard requires --gt-inhard-csv")
+    if args.gt_source == "wgo" and not args.gt_manifest:
+        ap.error("--gt-source wgo requires --gt-manifest")
 
     report: dict[str, Any] = {}
     for spec in args.run:
@@ -314,7 +367,12 @@ def main() -> None:
         name, _, path = spec.partition("=")
         run_dir = Path(path)
         pred_segs, fps = load_predicted_segments(run_dir)
-        gt_segs = load_gt_segments_agibot(args.gt_task_info, fps)
+        if args.gt_source == "inhard":
+            gt_segs = load_gt_segments_inhard(args.gt_inhard_csv, fps)
+        elif args.gt_source == "wgo":
+            gt_segs = load_gt_segments_wgo(args.gt_manifest, fps)
+        else:
+            gt_segs = load_gt_segments_agibot(args.gt_task_info, fps)
         print(f"[loaded] {name}: {len(pred_segs)} videos (pred), {len(gt_segs)} videos (GT) from {run_dir}")
         report[name] = evaluate_run(pred_segs, gt_segs, args.tolerances, args.iou_thresholds)
 
