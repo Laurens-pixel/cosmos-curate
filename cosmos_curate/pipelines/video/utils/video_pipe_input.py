@@ -157,7 +157,8 @@ def extract_single_cam_split_tasks(  # noqa: PLR0913
         input_videos = get_files_relative(input_path, client_input, _limit)
 
     # apply filter func
-    all_videos = list(input_videos)
+    _VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".h264", ".ts", ".webm"}
+    all_videos = [v for v in input_videos if any(v.lower().endswith(ext) for ext in _VIDEO_EXTS)]
     logger.info(f"Found {len(all_videos)} input videos in {input_path}")
     if verbose:
         for video in all_videos:

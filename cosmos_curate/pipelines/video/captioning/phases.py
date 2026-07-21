@@ -24,6 +24,7 @@ from cosmos_curate.pipelines.video.captioning.captioning_stages import (
 )
 from cosmos_curate.pipelines.video.captioning.gemini_caption_stage import ApiPrepStage, GeminiCaptionStage
 from cosmos_curate.pipelines.video.captioning.gemma4_direct_stage import Gemma4DirectCaptionStage
+from cosmos_curate.pipelines.video.captioning.marlin_stage import MarlinCaptionStage
 from cosmos_curate.pipelines.video.captioning.openai_caption_stage import OpenAICaptionStage
 from cosmos_curate.pipelines.video.captioning.vllm_caption_stage import VllmCaptionStage, VllmPrepStage
 from cosmos_curate.pipelines.video.preview.preview_stages import PreviewStage
@@ -96,7 +97,7 @@ class CaptioningConfig:
     verbose: bool = False
     perf_profile: bool = False
     gt_window_source: str | None = None
-    gt_task_info_dir: str | None = None
+    gt_window_cfg: dict = attrs.Factory(dict)
 
 
 @attrs.define(frozen=True)
@@ -171,7 +172,7 @@ class CaptioningPhase(CurationPhase):
             verbose=cfg.verbose,
             log_stats=cfg.perf_profile,
             gt_window_source=cfg.gt_window_source,
-            gt_task_info_dir=cfg.gt_task_info_dir,
+            gt_window_cfg=cfg.gt_window_cfg,
         )
 
     def _build_caption_stage(self) -> CuratorStage | CuratorStageSpec:
@@ -236,6 +237,19 @@ class CaptioningPhase(CurationPhase):
         """Construct and return the prep, optional preview, caption, and enhance stages."""
         cfg = self._cfg
 
+
+        # Marlin-2B uses a single combined stage (no vLLM)
+        if cfg.caption_algo.lower() == "marlin":
+            return [
+                MarlinCaptionStage(
+                    window_config=cfg.window_config,
+                    keep_mp4=cfg.keep_mp4,
+                    gt_window_source=cfg.gt_window_source,
+                    gt_window_cfg=cfg.gt_window_cfg,
+                    verbose=cfg.verbose,
+                    log_stats=cfg.perf_profile,
+                )
+            ]
 
         # Gemma4 uses a single combined stage (no vLLM)
         if cfg.caption_algo.lower() == "gemma4":

@@ -131,6 +131,27 @@ _PROMPTS = {
     }
     ```
     """,
+    "robot_reason_brief": """
+    Watch this short robot point-of-view clip and identify exactly what object is being
+    manipulated and what is done with it.
+
+    First, reason carefully about the object's identity from its visible features (shape,
+    colour, size, texture, markings) — be as specific as the pixels justify: "torx T25
+    screwdriver" beats "screwdriver" beats "tool", but never guess beyond what is visible.
+    Do all of this reasoning BEFORE answering.
+
+    Then output a single JSON object and nothing else:
+    {"caption": "<ONE sentence, at most 25 words: the specific object, the action, and the outcome>", "action": "<the main action verb>", "object": "<the specific object being manipulated, or null if none>"}
+
+    Rules for the caption sentence:
+    - Spend your word budget on the manipulated object's specific identity, not the scene.
+    - Mention NO other objects — no background items, no nearby objects, no scene inventory.
+      Every extra object named is a potential error; only the target of the action belongs.
+    - No hedging ("appears to", "what looks like") and no commentary about the robot's skill,
+      camera angle, or precision. Just the fact: object, action, outcome.
+    - If the exact object type is unclear, name its most distinctive visible feature in 2-3
+      words ("dark-capped mushroom") instead of guessing a species or brand.
+    """,
     "robot_reason": """
     Describe what happens in this short robot point-of-view clip in detail, getting the object
     identity and the action exactly right.

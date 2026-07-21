@@ -149,6 +149,7 @@ class ShotBoundarySplitConfig:
 
     model: Literal[
         "pyscenedetect",
+        "steervit",
         "semantic_clip",
         "semantic_siglip2",
         "semantic_dinov2",
@@ -171,12 +172,16 @@ class ShotBoundarySplitConfig:
         "predictive_vjepa2_ac_native_predictor",
         "predictive_vjepa2_joint_horizon",
         "predictive_vjepa2_mc_uncertainty",
-        "predictive_vjepa2_multiscale_error",
-        "predictive_vjepa2_adaptive_stats",
-        "predictive_vjepa2_adaptive_multiscale",
-        "predictive_dinov3",
-        "predictive_fusion",
+        "predictive_vjepa2_multiscale_error",            "predictive_vjepa2_adaptive_stats",
+            "predictive_vjepa2_adaptive_multiscale",
+            "predictive_vjepa2_adaptive_stats_fusion",
+            "predictive_vjepa2_adaptive_stats_siglip2",
+            "predictive_vjepa2_adaptive_stats_min_gap",
+            "predictive_dinov3",
+            "predictive_fusion",
         "fusion_arc_predictive",
+        "fusion_arc_predictive_vjepa2_adaptive_stats",
+        "fusion_arc_predictive_vjepa2_multiscale_error",
     ] = "pyscenedetect"
     # Shared clip filtering / shaping
     min_length_s: float = 2.0
@@ -263,6 +268,7 @@ class ShotBoundarySplitPhase(CurationPhase):
                 ),
             ]
         if cfg.model in {
+            "steervit",
             "semantic_clip",
             "semantic_siglip2",
             "semantic_dinov2",
@@ -288,8 +294,14 @@ class ShotBoundarySplitPhase(CurationPhase):
             "predictive_vjepa2_multiscale_error",
             "predictive_vjepa2_adaptive_stats",
             "predictive_vjepa2_adaptive_multiscale",
+            "predictive_vjepa2_adaptive_stats_fusion",
+            "predictive_vjepa2_adaptive_stats_siglip2",
+            "predictive_vjepa2_adaptive_stats_min_gap",
             "predictive_dinov3",
             "predictive_fusion",
+            "fusion_arc_predictive",
+            "fusion_arc_predictive_vjepa2_adaptive_stats",
+            "fusion_arc_predictive_vjepa2_multiscale_error",
         }:
             detector_cfg = DetectorConfig(
                 sample_fps=cfg.sample_fps,

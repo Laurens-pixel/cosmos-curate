@@ -39,7 +39,7 @@ class JudgePhaseConfig:
 
 def _build_gt_source(name: str, kwargs: dict[str, object]) -> GtSource:
     cls = get_gt_source_class(name)
-    return cls(**kwargs)  # type: ignore[arg-type]
+    return cls.from_config(kwargs)
 
 
 class JudgePhase(CurationPhase):

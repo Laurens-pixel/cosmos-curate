@@ -906,6 +906,37 @@ _CLASS_E_VARIANTS: dict[str, dict[str, object]] = {
         "ridge_mode": "scaled",
         "ridge_scale": 0.5,
     },
+    # Config G: adaptive stats + DINOv3 appearance stream (no VLM, still Class E).
+    # Dynamics (V-JEPA2) catches motion discontinuities; DINOv3 catches object/visual changes
+    # that have little motion. Adaptive stats keeps the self-moderating threshold.
+    "predictive_vjepa2_adaptive_stats_fusion": {
+        "model_id": _GIANT,
+        "anticipator": "linear",
+        "z_norm": "mean_std",
+        "ridge_mode": "scaled",
+        "ridge_scale": 0.5,
+        "stream_weights": (1.0, 0.5),
+    },
+    # Config H: adaptive stats + SigLIP2 appearance stream.
+    # SigLIP2 is trained with semantic alignment, so it may better catch object-identity changes
+    # (e.g. new tool/object in frame) than DINOv3, which is more appearance/texture focused.
+    "predictive_vjepa2_adaptive_stats_siglip2": {
+        "model_id": _GIANT,
+        "anticipator": "linear",
+        "z_norm": "mean_std",
+        "ridge_mode": "scaled",
+        "ridge_scale": 0.5,
+        "stream_weights": (1.0, 1.0),
+    },
+    # Config I: adaptive stats with no post-boundary ridge dead-zone.
+    # The scaled ridge suppresses echoes of a boundary, but on WGO some gold boundaries are
+    # only ~1 s apart; removing the forward dead-zone lets the detector keep valid close cuts.
+    "predictive_vjepa2_adaptive_stats_min_gap": {
+        "model_id": _GIANT,
+        "anticipator": "linear",
+        "z_norm": "mean_std",
+        "ridge_mode": "min_gap_only",
+    },
 }
 
 
@@ -918,6 +949,18 @@ def build_predictive_detector(model_name: str, cfg: PredictiveBoundaryConfig) ->
         if merged.anticipator == "ac_native":
             # AC path loads Meta hub weights lazily in detect_boundaries — no HF encoder.
             return PredictiveSurpriseBoundaryDetector([], merged)
+        # Appearance-stream fusion variants: keep V-JEPA2 dynamics as stream 0 and add a
+        # per-frame appearance encoder on the same tubelet grid.
+        if model_name.endswith("_adaptive_stats_fusion"):
+            return PredictiveSurpriseBoundaryDetector(
+                [VJepa2TubeletEncoder(merged, model_id), FrameCLSEncoder("dinov3", merged, pair_frames=2)],
+                merged,
+            )
+        if model_name.endswith("_adaptive_stats_siglip2"):
+            return PredictiveSurpriseBoundaryDetector(
+                [VJepa2TubeletEncoder(merged, model_id), FrameCLSEncoder("siglip2", merged, pair_frames=2)],
+                merged,
+            )
         return PredictiveSurpriseBoundaryDetector([VJepa2TubeletEncoder(merged, model_id)], merged)
     if model_name in _VJEPA2_SIZES:
         return PredictiveSurpriseBoundaryDetector([VJepa2TubeletEncoder(cfg, _VJEPA2_SIZES[model_name])], cfg)

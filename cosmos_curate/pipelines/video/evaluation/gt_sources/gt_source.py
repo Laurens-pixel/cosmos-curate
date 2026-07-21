@@ -7,6 +7,7 @@ action description string. It is orthogonal to the judge model: a Gemma4 text ju
 can be paired with any GT source, including ``NoneGt`` for reference-free use.
 """
 
+import inspect
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -18,6 +19,13 @@ class GtSource(ABC):
     @abstractmethod
     def name() -> str:
         """Return the unique GT source identifier (e.g. ``agibot``, ``manual``, ``none``)."""
+
+    @classmethod
+    def from_config(cls, cfg: dict[str, Any]) -> "GtSource":
+        """Instantiate from a dataset config dict, passing only recognised kwargs."""
+        params = inspect.signature(cls.__init__).parameters
+        kwargs = {k: cfg[k] for k in params if k not in ("self",) and k in cfg}
+        return cls(**kwargs)
 
     @abstractmethod
     def lookup(

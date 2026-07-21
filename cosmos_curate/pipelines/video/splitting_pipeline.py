@@ -102,7 +102,7 @@ from cosmos_curate.pipelines.video.utils.video_pipe_input import (
 QWEN2_CAPTION_ALGOS = {"qwen"}
 QWEN3_CAPTION_ALGOS = {"qwen3_vl_30b", "qwen3_vl_30b_fp8", "qwen3_vl_235b", "qwen3_vl_235b_fp8"}
 COSMOS_REASON_ALGOS = {"cosmos_r1", "cosmos_r2"}
-ALL_CAPTION_ALGOS = VLLM_CAPTION_ALGOS | {"gemini", "openai", "gemma4"}
+ALL_CAPTION_ALGOS = VLLM_CAPTION_ALGOS | {"gemini", "openai", "gemma4", "marlin"}
 MULTICAM_VIDEO_EXTENSIONS: set[str] = {".mp4"}
 QWEN3_VL_235B_HIGH_MEMORY_GPU_THRESHOLD_MB = 128_000
 
@@ -155,10 +155,7 @@ def build_input_data(
         error_msg = "Multi-cam only supports fixed-stride splitting; set --splitting-algorithm fixed-stride"
         raise ValueError(error_msg)
 
-    if args.gt_windows_source is not None:
-        if not args.gt_windows_task_info_dir:
-            msg = "--gt-windows-task-info-dir is required when --gt-windows-source is set."
-            raise ValueError(msg)
+    if args.gt_windows_source:
         # GT frame ranges are video-absolute; the whole video must be one clip so frame
         # numbers align. Force fixed-stride with a 1-hour duration to achieve this.
         args.splitting_algorithm = "fixed-stride"
@@ -297,6 +294,18 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
 
     """
     builder = PipelineBuilder()
+
+    # Load dataset config (replaces all per-source path flags)
+    import json as _json
+    _dataset_cfg: dict = {}
+    if getattr(args, 'dataset_config', None):
+        _dataset_cfg = _json.loads(open(args.dataset_config).read())
+    _gt_windows_source = args.gt_windows_source or _dataset_cfg.get('gt_window_source')
+    _judge_gt_source = args.judge_gt_source or _dataset_cfg.get('gt_source')
+    if 'splitting_algorithm' in _dataset_cfg and args.splitting_algorithm == "shot-boundary":
+        args.splitting_algorithm = _dataset_cfg['splitting_algorithm']
+    if 'fixed_stride_split_duration' in _dataset_cfg:
+        args.fixed_stride_split_duration = _dataset_cfg['fixed_stride_split_duration']
 
     # --- Ingest (always) ---
     builder.add_phase(
@@ -713,45 +722,15 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                     multi_view=args.multi_view,
                     verbose=args.verbose,
                     perf_profile=args.perf_profile,
-                    gt_window_source=args.gt_windows_source,
-                    gt_task_info_dir=args.gt_windows_task_info_dir,
+                    gt_window_source=_gt_windows_source,
+                    gt_window_cfg=_dataset_cfg,
                 )
             )
         )
 
     # --- Evaluation / judging (optional) ---
     if args.evaluate:
-        gt_source_kwargs: dict[str, object] = {}
-        if args.judge_gt_source == "agibot":
-            if not args.judge_gt_task_info_dir:
-                msg = "--judge-gt-task-info-dir is required when --judge-gt-source=agibot."
-                raise ValueError(msg)
-            gt_source_kwargs["task_info_dir"] = args.judge_gt_task_info_dir
-        elif args.judge_gt_source == "manual":
-            if not args.judge_gt_annotation_path:
-                msg = "--judge-gt-annotation-path is required when --judge-gt-source=manual."
-                raise ValueError(msg)
-            gt_source_kwargs["annotation_path"] = args.judge_gt_annotation_path
-        elif args.judge_gt_source == "youcook2":
-            if not args.judge_gt_captions_path:
-                msg = "--judge-gt-captions-path is required when --judge-gt-source=youcook2."
-                raise ValueError(msg)
-            gt_source_kwargs["gt_captions_path"] = args.judge_gt_captions_path
-        elif args.judge_gt_source == "nuscenes":
-            if not args.judge_gt_scene_json_path:
-                msg = "--judge-gt-scene-json-path is required when --judge-gt-source=nuscenes."
-                raise ValueError(msg)
-            gt_source_kwargs["scene_json_path"] = args.judge_gt_scene_json_path
-        elif args.judge_gt_source == "inhard_online":
-            if not args.judge_gt_labels_dir:
-                msg = "--judge-gt-labels-dir is required when --judge-gt-source=inhard_online."
-                raise ValueError(msg)
-            gt_source_kwargs["labels_dir"] = args.judge_gt_labels_dir
-        elif args.judge_gt_source == "wgo":
-            if not args.judge_gt_manifest_path:
-                msg = "--judge-gt-manifest-path is required when --judge-gt-source=wgo."
-                raise ValueError(msg)
-            gt_source_kwargs["manifest_path"] = args.judge_gt_manifest_path
+        gt_source_kwargs: dict = _dataset_cfg
 
         for _variant in _active_judge_variants:
             builder.add_phase(
@@ -759,7 +738,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                     JudgePhaseConfig(
                         judge_variant=_variant,
                         caption_source=args.judge_caption_source or args.captioning_algorithm,
-                        gt_source=args.judge_gt_source,
+                        gt_source=_judge_gt_source,
                         gt_source_kwargs=gt_source_kwargs,
                         prompt_variant=args.judge_prompt_variant,
                         prompt_text=args.judge_prompt_text,
@@ -838,6 +817,18 @@ def _split(args: argparse.Namespace) -> None:
 
     """
     validate_stage_replay_args(args)
+
+    # Resolve gt_windows_source and splitting_algorithm from dataset config before
+    # build_input_data needs them (gt_windows_source forces fixed-stride 3600s).
+    if getattr(args, "dataset_config", None):
+        import json as _json_split
+        _split_cfg = _json_split.loads(open(args.dataset_config).read())
+        if not args.gt_windows_source:
+            args.gt_windows_source = _split_cfg.get("gt_window_source")
+        if 'splitting_algorithm' in _split_cfg and args.splitting_algorithm == "shot-boundary":
+            args.splitting_algorithm = _split_cfg['splitting_algorithm']
+        if 'fixed_stride_split_duration' in _split_cfg:
+            args.fixed_stride_split_duration = _split_cfg['fixed_stride_split_duration']
 
     zero_start = time.time()
     input_tasks, input_videos_relative, _, num_input_videos_selected = build_input_data(args)
@@ -1038,6 +1029,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         choices=[
             "transnetv2",
             "pyscenedetect",
+            "steervit",
             "semantic_clip",
             "semantic_siglip2",
             "semantic_dinov2",
@@ -1063,9 +1055,14 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
             "predictive_vjepa2_multiscale_error",
             "predictive_vjepa2_adaptive_stats",
             "predictive_vjepa2_adaptive_multiscale",
+            "predictive_vjepa2_adaptive_stats_fusion",
+            "predictive_vjepa2_adaptive_stats_siglip2",
+            "predictive_vjepa2_adaptive_stats_min_gap",
             "predictive_dinov3",
             "predictive_fusion",
             "fusion_arc_predictive",
+            "fusion_arc_predictive_vjepa2_adaptive_stats",
+            "fusion_arc_predictive_vjepa2_multiscale_error",
         ],
         help=(
             "Boundary detector when --splitting-algorithm=shot-boundary. "
@@ -1074,7 +1071,8 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
             "Class E: predictive_* (event boundaries from V-JEPA 2 world-model prediction error; "
             "deterministic and ~100x cheaper than the VLM detectors). "
             "Class E variants: native/ac_native (VJEPA2-AC), joint_horizon, mc_uncertainty, "
-            "multiscale_error, adaptive_stats, adaptive_multiscale."
+            "multiscale_error, adaptive_stats, adaptive_multiscale, adaptive_stats_fusion, "
+            "adaptive_stats_siglip2, adaptive_stats_min_gap."
         ),
     )
     parser.add_argument(
@@ -1635,6 +1633,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
             "av-surveillance",
             "agibot",
             "robot_reason",
+            "robot_reason_brief",
             "inhard",
             "youcook2",
         ],
@@ -2077,61 +2076,26 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     parser.add_argument(
         "--judge-gt-source",
         type=str,
-        default="agibot",
-        help="GT source plugin name (agibot | manual | youcook2 | nuscenes | inhard_online | wgo | none).",
-    )
-    parser.add_argument(
-        "--judge-gt-task-info-dir",
-        type=str,
         default=None,
-        help="For --judge-gt-source=agibot: directory containing task_<id>.json files.",
-    )
-    parser.add_argument(
-        "--judge-gt-annotation-path",
-        type=str,
-        default=None,
-        help="For --judge-gt-source=manual: path to annotation_*_ground_truth.json.",
-    )
-    parser.add_argument(
-        "--judge-gt-captions-path",
-        type=str,
-        default=None,
-        help="For --judge-gt-source=youcook2: path to gt_captions.json.",
-    )
-    parser.add_argument(
-        "--judge-gt-scene-json-path",
-        type=str,
-        default=None,
-        help="For --judge-gt-source=nuscenes: path to scene.json from a nuScenes v1.0 metadata dir.",
-    )
-    parser.add_argument(
-        "--judge-gt-labels-dir",
-        type=str,
-        default=None,
-        help="For --judge-gt-source=inhard_online: directory containing .anvil annotation files.",
-    )
-    parser.add_argument(
-        "--judge-gt-manifest-path",
-        type=str,
-        default=None,
-        help="For --judge-gt-source=wgo: path to WGO-Bench episode_manifest.json.",
+        help="GT source name override (e.g. agibot, assembly101, wgo, unitree_g1, none). "
+             "Reads from --dataset-config gt_source field when not set.",
     )
     # ── GT-window captioning ────────────────────────────────────────────────
     parser.add_argument(
         "--gt-windows-source",
         type=str,
         default=None,
-        help=(
-            "Use GT action frame ranges as caption windows instead of TransNetV2 windowing. "
-            "Registered sources: agibot. When set, --splitting-algorithm is forced to "
-            "'fixed-stride' with a 1-hour clip duration so the whole video is one clip."
-        ),
+        help="GT window provider name override (e.g. agibot, assembly101, wgo). "
+             "Reads from --dataset-config gt_window_source when not set. "
+             "Forces fixed-stride splitting at 3600 s so GT frame numbers align.",
     )
     parser.add_argument(
-        "--gt-windows-task-info-dir",
+        "--dataset-config",
         type=str,
         default=None,
-        help="Directory containing task_<id>.json files (required when --gt-windows-source is set).",
+        help="Path to a dataset config JSON file supplying gt_window_source, gt_source, "
+             "and all annotation paths needed by those plugins (e.g. task_info_dir, "
+             "manifest_path, labels_dir, base_dir). Replaces all former per-source flags.",
     )
     # add common args applicable to all pipelines
     add_common_args(parser)

@@ -225,7 +225,7 @@ class VllmPrepStage(CuratorStage):
         log_stats: bool = False,
         multi_view: bool = False,
         gt_window_source: str | None = None,
-        gt_task_info_dir: str | None = None,
+        gt_window_cfg: dict | None = None,
     ) -> None:
         """Initialize the vLLM Preparation Stage.
 
@@ -239,7 +239,7 @@ class VllmPrepStage(CuratorStage):
                 combined multi-view caption per scene (stored on CAM_FRONT clip only).
             gt_window_source: GT window provider name (e.g. ``"agibot"``).  When set,
                 ``compute_windows`` is bypassed and GT action frame ranges are used instead.
-            gt_task_info_dir: Path to task info directory passed to the provider constructor.
+            gt_window_cfg: Dataset config dict passed to the provider's ``from_config()``.
 
         """
         super().__init__()
@@ -254,7 +254,7 @@ class VllmPrepStage(CuratorStage):
         self._model = VllmModelInterface(self._vllm_config)
         self._multi_view = multi_view
         self._gt_window_source = gt_window_source
-        self._gt_task_info_dir = gt_task_info_dir
+        self._gt_window_cfg = gt_window_cfg or {}
         self._gt_provider: GTWindowProvider | None = None
         # Buffer: scene_id -> {camera_name -> (Video, task)}. Used only when multi_view=True.
         # Tasks are stored here so they can be retrieved across batches when a triplet completes.
@@ -309,10 +309,8 @@ class VllmPrepStage(CuratorStage):
     def stage_setup(self) -> None:
         """Set up the model for processing."""
         self._processor = auto_processor(self._vllm_config)
-        if self._gt_window_source is not None and self._gt_task_info_dir is not None:
-            self._gt_provider = make_gt_window_provider(
-                self._gt_window_source, task_info_dir=self._gt_task_info_dir
-            )
+        if self._gt_window_source is not None:
+            self._gt_provider = make_gt_window_provider(self._gt_window_source, self._gt_window_cfg)
 
     def _parse_scene_camera(self, video: Video) -> tuple[str, str]:
         """Parse the source video filename into (scene_id, camera_name).

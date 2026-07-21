@@ -854,6 +854,17 @@ class DetectorConfig:
     predictive_history: int = 4
     predictive_z_threshold: float = 2.0
     predictive_min_segment_s: float = 1.0
+    # Class G (steervit): interaction-steered encoder + ABD minima. The steering prompt makes the
+    # per-frame feature concentrate on the hands + tool + manipulated object, so a boundary is where
+    # *what is being interacted with* changes — the object-as-task-proxy inductive bias. Cheap
+    # (frozen DINOv2-base + 93 MB steering layers), unlike ARC/V-JEPA.
+    steervit_steering_prompt: str = "the person's hands and the tool and object they are manipulating"
+    # "abd" = adjacent-frame minima (original); "changepoint" = bidirectional window comparison.
+    steervit_scorer: str = "changepoint"
+    steervit_half_window: int = 3
+    steervit_min_gap_s: float = 1.5
+    steervit_ckpt: str = "/config/models/JonaRuthardt/SteerViT/steervit_dinov2_base.pth"
+    steervit_src_path: str = "/config/SteerViT/src"
     # Class F (fusion_arc_*): ARC-Hunyuan chapter anchors + predictive infill.
     arc_model_dir: str = "/config/models/TencentARC/ARC-Hunyuan-Video-7B"
     arc_max_new_tokens: int = 1024
@@ -977,6 +988,162 @@ class SemanticABDBoundaryDetector:
         if len(frames) < 3:
             return []
         emb = self._encode(frames)
+        if self.cfg.steervit_scorer == "changepoint":
+            return _changepoint_boundaries(
+                emb, ts, alpha=self.cfg.alpha,
+                half_window=self.cfg.steervit_half_window,
+                min_gap_s=self.cfg.steervit_min_gap_s,
+            )
+        return _abd_boundaries(emb, ts, alpha=self.cfg.alpha)
+
+
+# Steering prompts per domain. The prompt is what the encoder is told to look at, so it is the
+# single highest-leverage knob: a generic prompt made SteerViT win on tabletop footage (galaxea
+# 0.578) but lose on DROID's varied scenes (robointer 0.411). Each entry names the actor, the tool
+# and the manipulated object, because those are what define a task boundary (Meo: a task is
+# "interacting with an object", optionally "through a tool").
+STEERVIT_DOMAIN_PROMPTS: dict[str, str] = {
+    "generic": "the person's hands and the tool and object they are manipulating",
+    # Robot arm, fixed camera, tabletop pick-and-place: the gripper IS the actor.
+    "robot_tabletop": "the robot gripper and the object it is grasping",
+    # DROID-style: varied scenes/viewpoints, so anchor hard on the gripper-object contact itself.
+    "robot_varied": "the robot gripper closing on an object, and the object being moved",
+    # Human first-person household (homer, wearable): bare hands are the tool.
+    "human_ego": "the person's hands and the object they are holding",
+    # Industrial assembly (Assembly101, InHARD): tool + part is the defining pair.
+    "assembly": "the hands, the hand tool, and the part being assembled",
+    # Humanoid robot with two arms (G1, AgiBot).
+    "humanoid": "the robot hands and the object being picked up or put down",
+}
+
+
+def _changepoint_boundaries(
+    features: npt.NDArray[np.float32],
+    timestamps: list[float],
+    *,
+    alpha: float,
+    half_window: int = 3,
+    min_gap_s: float = 1.5,
+) -> list[float]:
+    """Bidirectional change-point detection on an embedding sequence.
+
+    Adjacent-frame cosine (``_abd_boundaries``) is purely local and causal-ish: it asks "did this
+    frame differ from the last one", which is dominated by jitter and by whichever single frame is
+    blurry. Here the score at ``i`` compares the MEAN embedding of the ``half_window`` frames
+    BEFORE ``i`` against the mean of the ``half_window`` frames AFTER it, so each decision uses
+    future as well as past context and averages away per-frame noise. That matters because we are
+    annotating offline, where nothing forces the signal to be causal.
+
+    Peaks are kept with a robust median/MAD z-score (a boundary is an outlier, so the standard
+    deviation is inflated by the very events we are hunting), then thinned by ``min_gap_s`` so two
+    cuts cannot land inside one action.
+    """
+    n = features.shape[0]
+    if n < 2 * half_window + 1 or len(timestamps) < n:
+        return []
+    f = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
+    score = np.zeros(n, dtype=np.float32)
+    for i in range(half_window, n - half_window):
+        before = f[i - half_window : i].mean(axis=0)
+        after = f[i : i + half_window].mean(axis=0)
+        denom = float(np.linalg.norm(before) * np.linalg.norm(after)) + 1e-8
+        score[i] = 1.0 - float(before @ after) / denom  # high = the interaction changed
+
+    valid = score[half_window : n - half_window]
+    med = float(np.median(valid))
+    mad = float(np.median(np.abs(valid - med)))
+    scale = mad * 1.4826 if mad > 1e-6 else (float(valid.std()) or 1e-6)  # noqa: PLR2004
+    z = (score - med) / scale
+
+    cands = [
+        i
+        for i in range(half_window + 1, n - half_window - 1)
+        if z[i] >= alpha and score[i] >= score[i - 1] and score[i] >= score[i + 1]
+    ]
+    # Greedy strongest-first thinning: keep the highest peak, drop anything within min_gap_s of an
+    # accepted cut. Enforces that segments cannot be shorter than one plausible action.
+    kept: list[int] = []
+    for i in sorted(cands, key=lambda j: -z[j]):
+        if all(abs(timestamps[i] - timestamps[k]) >= min_gap_s for k in kept):
+            kept.append(i)
+    return [timestamps[i] for i in sorted(kept)]
+
+
+class SteerViTBoundaryDetector:
+    """Class G: interaction-steered encoder + ABD-style minima.
+
+    Instead of prediction error (which conflates "the model can't predict" with "the task changed"),
+    the boundary signal is a change in *what the hands are interacting with*. SteerViT injects a text
+    prompt into a frozen DINOv2 via gated cross-attention, so the per-frame global feature focuses on
+    the hands, the tool, and the manipulated object rather than the static scene (same arm, same
+    background) that made plain semantic encoders saturate. A boundary is a local minimum of
+    cosine similarity between successive steered features — the moment the interaction changes.
+    """
+
+    def __init__(self, cfg: DetectorConfig) -> None:
+        self.cfg = cfg
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._model = None
+        self._transform = None
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+        # SteerViT ships as a source tree + vendored deps (omegaconf), neither on the Ray worker's
+        # path; inject both, unified-env site-packages first so tokenizers/timm resolve.
+        for p in (
+            "/opt/cosmos-curate/.pixi/envs/unified/lib/python3.12/site-packages",
+            "/config/pip_overrides",
+            self.cfg.steervit_src_path,
+        ):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        from steervit import SteerViT
+
+        self._model = SteerViT.from_pretrained(self.cfg.steervit_ckpt, device=self._device)
+        self._transform = self._model.get_transforms()
+
+    def _encode(
+        self,
+        frames: list[npt.NDArray[np.uint8]],
+        prompt: str | None = None,
+        batch_size: int = 32,
+    ) -> npt.NDArray[np.float32]:
+        """Encode frames into steered global features.
+
+        ``prompt`` overrides the configured steering text for this call only. The text is a
+        per-call argument to the model, so re-steering does NOT require rebuilding the detector:
+        a benchmark sweeping N prompts loads the weights once, not once per prompt. (Doing the
+        latter cost ~10 s per prompt per video and dominated an entire sweep's runtime.)
+
+        Runs under fp16 autocast on CUDA: these features are only ever compared by cosine
+        similarity, so half precision changes nothing that matters and roughly halves the time.
+        """
+        self._load()
+        assert self._model is not None
+        assert self._transform is not None
+        text = prompt if prompt is not None else self.cfg.steervit_steering_prompt
+        feats: list[npt.NDArray[np.float32]] = []
+        use_amp = self._device == "cuda"
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+            for i in range(0, len(frames), batch_size):
+                b = frames[i : i + batch_size]
+                x = torch.stack([self._transform(Image.fromarray(f)) for f in b]).to(self._device)
+                out = self._model.get_global_features(x, texts=[text] * len(b))
+                feats.append(out.cpu().float().numpy())
+        return np.vstack(feats).astype(np.float32)
+
+    def detect_boundaries(self, video_path: str) -> list[float]:
+        frames, ts = _extract_frames_uniform(video_path, fps=self.cfg.sample_fps)
+        if len(frames) < 3:  # noqa: PLR2004 - ABD needs at least a triplet to find a minimum
+            return []
+        emb = self._encode(frames)
+        if self.cfg.steervit_scorer == "changepoint":
+            return _changepoint_boundaries(
+                emb, ts, alpha=self.cfg.alpha,
+                half_window=self.cfg.steervit_half_window,
+                min_gap_s=self.cfg.steervit_min_gap_s,
+            )
         return _abd_boundaries(emb, ts, alpha=self.cfg.alpha)
 
 
@@ -1166,6 +1333,8 @@ def build_boundary_detector(model_name: str, cfg: DetectorConfig) -> BoundaryDet
         from cosmos_curate.pipelines.video.clipping.predictive_boundary import build_predictive_detector
 
         return build_predictive_detector(model_name, predictive_config_from(cfg))
+    if model_name == "steervit":
+        return SteerViTBoundaryDetector(cfg)
     if model_name == "semantic_clip":
         return SemanticABDBoundaryDetector("clip", cfg)
     if model_name == "semantic_siglip2":

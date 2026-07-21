@@ -50,11 +50,16 @@ Example::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import random
+import signal
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from cosmos_curate.pipelines.video.evaluation.benchmark_captions import (
     WindowRec,
@@ -77,6 +82,35 @@ from cosmos_curate.pipelines.video.evaluation.benchmark_textvideo import (
 # object pass draws the SAME random window sample for every detector, so comparisons between
 # segmenters are never confounded by them being scored on different windows.
 _SAMPLE_SEED = 1234
+# Hard cap on decoding ONE window. Measured decode is 0.16 s/window on WGO (job 24570282), so this
+# is ~750x the real cost and only ever fires on a genuinely wedged file. It is a cheap backstop, NOT
+# the fix for the 5 h stall on job 24566840 -- that was shard contention (see run_e2e.sh), and
+# decode was never the bottleneck.
+_DECODE_TIMEOUT_S = 120
+# Hard cap on ONE detector batch. Measured cost is ~1.13 s/window (4 windows/batch => ~5 s), so 300 s
+# is ~60x the real cost and only fires on a wedged CUDA call.
+_DETECT_TIMEOUT_S = 300
+
+
+@contextlib.contextmanager
+def _time_limit(seconds: int) -> Iterator[None]:
+    """Raise TimeoutError if the block runs longer than ``seconds``.
+
+    SIGALRM-based, so it interrupts C-level calls (PyAV/ffmpeg) that a thread-based timeout could
+    not. Only valid on the main thread, which is where each shard's sweep runs.
+    """
+
+    def _raise(signum: int, frame: Any) -> None:  # noqa: ANN401, ARG001
+        msg = f"decode exceeded {seconds}s"
+        raise TimeoutError(msg)
+
+    prev = signal.signal(signal.SIGALRM, _raise)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, prev)
 
 
 def load_vocab(vocab_file: Path | None) -> list[str]:
@@ -280,6 +314,7 @@ def detect_run(
     batch_windows: int = 4,
     image_size: int = 480,
     time_budget_s: float | None = None,
+    checkpoint: Path | None = None,
 ) -> dict[str, Any]:
     """Detect objects per window and assemble the nested output dict.
 
@@ -305,6 +340,7 @@ def detect_run(
     started = time.monotonic()
     out: dict[str, Any] = {}
     n_done = 0
+    n_skipped = 0
     pending: list[tuple[WindowRec, list[Any]]] = []
 
     def _detect_group(group: list[tuple[WindowRec, list[Any]]]) -> None:
@@ -332,11 +368,29 @@ def detect_run(
             n_done += 1
 
     def flush() -> None:
+        nonlocal n_skipped
         if not pending:
             return
-        _detect_group(list(pending))
+        # Guard the GPU batch, not just the decode. The 100-video runs stalled INSIDE detection --
+        # both jobs wedged at exactly 60 windows (~68 s in), having run at the expected 1.13 s/window
+        # up to that point, then sat silent until walltime. The per-window budget check cannot fire
+        # while a single batch is wedged, so the entire job was lost. A batch that exceeds this cap
+        # is abandoned and the sweep continues.
+        try:
+            with _time_limit(_DETECT_TIMEOUT_S):
+                _detect_group(list(pending))
+        except (TimeoutError, Exception) as exc:  # noqa: BLE001 - a wedged CUDA call may surface anything
+            n_skipped += len(pending)
+            print(f"[detect] SKIP batch of {len(pending)}: {type(exc).__name__}: {exc}", flush=True)
         pending.clear()
-        print(f"[detect] {n_done} windows processed", flush=True)
+        # Checkpoint after every batch. Previously results were written only once, at the very end:
+        # when a shard was killed mid-sweep (walltime) it wrote nothing at all, so ~5 h of detection
+        # produced object_faithfulness=None. A partial sweep is still a valid uniform random sample
+        # (recs are shuffled), so persisting it is strictly better than losing it.
+        if checkpoint is not None:
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_text(json.dumps(out, indent=2))
+        print(f"[detect] {n_done} windows processed ({time.monotonic() - started:.0f}s elapsed)", flush=True)
 
     budget_hit = False
     for r in recs:
@@ -361,9 +415,17 @@ def detect_run(
         # not native (WGO mixes 320x180 with 2560x1440; a detector batch pads to the largest image
         # in it, so one 3.7 MP frame inflates all 32 and OOMs the GPU — which is exactly what
         # happened: the shards thrashed and ran ~47x slower than on the uniform-resolution smoke).
-        frames = decode_window_frames(
-            video_path, start_s, end_s, num_frames, bounded=(image_size, int(image_size * 5 / 3))
-        )
+        # Backstop only: bound each decode so one corrupt file cannot stall the sweep past the
+        # budget check (which runs once per window, above). Decode is 0.16 s/window in practice.
+        try:
+            with _time_limit(_DECODE_TIMEOUT_S):
+                frames = decode_window_frames(
+                    video_path, start_s, end_s, num_frames, bounded=(image_size, int(image_size * 5 / 3))
+                )
+        except (TimeoutError, Exception) as exc:  # noqa: BLE001 - a bad video may raise anything
+            n_skipped += 1
+            print(f"[detect] SKIP {video_path.name} [{start_s:.1f}-{end_s:.1f}s]: {type(exc).__name__}", flush=True)
+            continue
         if not frames:
             continue
         pending.append((r, frames))
@@ -378,7 +440,7 @@ def detect_run(
             f"is a uniform random sample — the object metrics stay unbiased, with a wider CI.",
             flush=True,
         )
-    print(f"[detect] done: {n_done} windows with detections in {elapsed / 60:.1f} min")
+    print(f"[detect] done: {n_done} windows with detections in {elapsed / 60:.1f} min ({n_skipped} skipped)")
     return out
 
 
@@ -501,6 +563,7 @@ def main() -> None:
         raise SystemExit(1)
 
     clip_meta = load_clip_meta(args.run)
+    dest = args.out or (args.run / "v0" / "all_window_objects.json")
     out = detect_run(
         recs,
         clip_meta,
@@ -511,9 +574,9 @@ def main() -> None:
         args.batch_windows,
         args.detector_image_size,
         args.time_budget_s,
+        dest,
     )
 
-    dest = args.out or (args.run / "v0" / "all_window_objects.json")
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(out, indent=2))
     print(f"[detect] wrote object detections → {dest}")

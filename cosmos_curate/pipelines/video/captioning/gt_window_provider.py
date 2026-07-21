@@ -13,6 +13,7 @@ Usage in the pipeline::
 
 """
 
+import inspect
 import json
 import re
 from abc import ABC, abstractmethod
@@ -34,6 +35,13 @@ class GTWindowProvider(ABC):
     boundaries.  The pipeline calls ``get_windows(video_path)`` for every video
     instead of running ``compute_windows()`` (TransNetV2-based windowing).
     """
+
+    @classmethod
+    def from_config(cls, cfg: dict[str, Any]) -> "GTWindowProvider":
+        """Instantiate from a dataset config dict, passing only recognised kwargs."""
+        params = inspect.signature(cls.__init__).parameters
+        kwargs = {k: cfg[k] for k in params if k not in ("self",) and k in cfg}
+        return cls(**kwargs)
 
     @abstractmethod
     def get_windows(self, video_path: str) -> list[WindowFrameInfo] | None:
@@ -129,12 +137,129 @@ class AgiBotGTWindowProvider(GTWindowProvider):
         return windows
 
 
+# ── Assembly101 implementation ────────────────────────────────────────────────
+
+
+class Assembly101GTWindowProvider(GTWindowProvider):
+    """GT window provider for Assembly101 using coarse TSV annotation files.
+
+    Reads ``coarse_labels/{assembly_|disassembly_}{seq}.txt`` files where each
+    line is ``start_frame\\tend_frame\\taction_label`` at **60 fps**.
+
+    The video filename → seq mapping is built from the dataset manifest
+    (``source_path = "recordings/{seq}/{cam}.mp4"``).
+
+    Args:
+        manifest_path: Path to ``manifest.json``.
+        labels_dir: Path to the ``coarse_labels/`` directory.
+
+    """
+
+    def __init__(self, manifest_path: str | Path, labels_dir: str | Path) -> None:
+        self._labels_dir = Path(labels_dir)
+        self._filename_to_seq: dict[str, str] = {}
+        self._seq_windows: dict[str, list[WindowFrameInfo]] = {}
+        self._loaded_seqs: set[str] = set()
+        self._load_manifest(Path(manifest_path))
+
+    def _load_manifest(self, manifest_path: Path) -> None:
+        if not manifest_path.exists():
+            logger.warning(f"Assembly101GTWindowProvider: manifest not found: {manifest_path}")
+            return
+        for entry in json.loads(manifest_path.read_text()):
+            fname = entry.get("video_filename", "")
+            src = entry.get("source_path", "")
+            parts = src.split("/")
+            if fname and len(parts) >= 2:
+                self._filename_to_seq[fname] = parts[1]
+
+    def _load_seq(self, seq: str) -> None:
+        if seq in self._loaded_seqs:
+            return
+        self._loaded_seqs.add(seq)
+        for prefix in ("assembly_", "disassembly_"):
+            path = self._labels_dir / f"{prefix}{seq}.txt"
+            if not path.exists():
+                continue
+            windows: list[WindowFrameInfo] = []
+            for line in path.read_text().splitlines():
+                parts = line.strip().split("\t")
+                if len(parts) < 3:
+                    continue
+                try:
+                    sf, ef = int(parts[0]), int(parts[1])
+                except ValueError:
+                    continue
+                if parts[2].strip() and ef > sf:
+                    windows.append(WindowFrameInfo(start=sf, end=ef))
+            if windows:
+                self._seq_windows[seq] = windows
+                return
+        logger.warning(f"Assembly101GTWindowProvider: no coarse_labels file for seq {seq!r}")
+
+    def get_windows(self, video_path: str) -> list[WindowFrameInfo] | None:
+        fname = Path(video_path).name
+        seq = self._filename_to_seq.get(fname)
+        if not seq:
+            logger.warning(f"Assembly101GTWindowProvider: no seq mapping for {fname!r}")
+            return None
+        self._load_seq(seq)
+        return self._seq_windows.get(seq)
+
+
+# ── WGO implementation ────────────────────────────────────────────────────────
+
+
+class WGOGTWindowProvider(GTWindowProvider):
+    """GT window provider for WGO-Bench using episode manifest segments.
+
+    The manifest entries contain ``segments: [{start_sec, end_sec, subtask}]``
+    and per-episode ``metadata.fps``.  Frame boundaries are computed as
+    ``round(start_sec * fps)``.
+
+    Args:
+        manifest_path: Path to the WGO episode manifest JSON.
+        default_fps: Fallback fps when metadata is missing (default 30.0).
+
+    """
+
+    def __init__(self, manifest_path: str | Path, default_fps: float = 30.0) -> None:
+        self._default_fps = default_fps
+        self._by_stem: dict[str, dict] = {}
+        for rec in json.loads(Path(manifest_path).read_text()):
+            stem = Path(rec.get("video_filename", f"{rec['id']}.mp4")).stem
+            meta = rec.get("metadata") or {}
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+            self._by_stem[stem] = {
+                "segments": rec.get("segments") or [],
+                "fps": float(meta.get("fps") or default_fps),
+            }
+
+    def get_windows(self, video_path: str) -> list[WindowFrameInfo] | None:
+        stem = Path(video_path).stem
+        ep = self._by_stem.get(stem)
+        if not ep:
+            logger.warning(f"WGOGTWindowProvider: no entry for {stem!r}")
+            return None
+        fps = ep["fps"]
+        windows = [
+            WindowFrameInfo(
+                start=round(seg["start_sec"] * fps),
+                end=round(seg["end_sec"] * fps),
+            )
+            for seg in ep["segments"]
+            if seg.get("end_sec", 0) > seg.get("start_sec", 0)
+        ]
+        return windows or None
+
+
 # ── Registry & factory ────────────────────────────────────────────────────────
 
 _GT_PROVIDERS: dict[str, type[GTWindowProvider]] = {
     "agibot": AgiBotGTWindowProvider,
-    # Add new dataset providers here, e.g.:
-    # "nuscenes": NuScenesGTWindowProvider,
+    "assembly101": Assembly101GTWindowProvider,
+    "wgo": WGOGTWindowProvider,
 }
 
 
@@ -143,12 +268,12 @@ def list_gt_window_sources() -> list[str]:
     return sorted(_GT_PROVIDERS.keys())
 
 
-def make_gt_window_provider(source: str, **kwargs: Any) -> GTWindowProvider:
-    """Instantiate the GT window provider for ``source``.
+def make_gt_window_provider(source: str, cfg: dict[str, Any]) -> GTWindowProvider:
+    """Instantiate the GT window provider for ``source`` from a dataset config dict.
 
     Args:
         source: Registered source name (e.g. ``"agibot"``).
-        **kwargs: Constructor keyword arguments for the provider class.
+        cfg: Dataset config dict — the provider picks only the keys it needs.
 
     Returns:
         A ``GTWindowProvider`` instance.
@@ -163,4 +288,4 @@ def make_gt_window_provider(source: str, **kwargs: Any) -> GTWindowProvider:
             f"Registered sources: {list_gt_window_sources()}"
         )
         raise ValueError(msg)
-    return _GT_PROVIDERS[source](**kwargs)
+    return _GT_PROVIDERS[source].from_config(cfg)
